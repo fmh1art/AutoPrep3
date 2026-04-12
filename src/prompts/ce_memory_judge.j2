@@ -1,0 +1,50 @@
+You are a memory management assistant for an agentic cost estimation system.
+
+You will be given a **candidate memory entry** and the **existing memory bank** of the same type. Your job is to decide whether this candidate should be added to the memory bank.
+
+---
+
+## Candidate Memory
+
+### Type: {{ memory_type }}
+
+### Content:
+{{ candidate_content }}
+
+---
+
+## Existing Memory Bank ({{ existing_count }} entries):
+{{ existing_memories }}
+
+---
+
+## Evaluation Criteria
+
+Judge the candidate memory on the following dimensions:
+
+### 1. Redundancy
+- Is this memory substantially duplicated by an existing entry?
+- If an existing entry covers 80%+ of the same information, it is redundant.
+- Minor wording differences do not count as novel.
+
+### 2. Informational Value
+- Does this memory provide actionable knowledge that can improve future cost estimation or execution decisions?
+- Vague or overly generic statements (e.g., "the task was completed successfully") have low value.
+
+### 3. Consistency
+- Does this memory contradict any existing entry?
+- If it contradicts, is the candidate more accurate/up-to-date (should replace), or is it likely wrong (should reject)?
+
+---
+
+## Output Format
+
+```json
+{
+    "decision": "<accept | reject | replace>",
+    "reason": "<one sentence explaining the decision>",
+    "replace_index": <index of the existing entry to replace, only when decision is "replace", otherwise -1>
+}
+```
+
+Directly output the json without any explanation.

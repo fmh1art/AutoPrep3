@@ -1,0 +1,31 @@
+Read and strictly follow the implementation plan at:
+
+  {{ plan_path }}
+
+Execute with a phased approach consistent with the project's prompt style:
+
+Phase 1. PLAN LOADING
+  - Parse the plan and extract steps and milestones
+  - Prepare required tools and environment
+
+Phase 2. IMPLEMENTATION (Minimal Viable Changes)
+  - Execute steps in order; minor adjustments are allowed but must be explained in the final summary
+  - Modify only necessary files; keep changes atomic and easily reversible
+
+Phase 3. VERIFICATION
+  - Run the specified commands/scripts for self-check; add critical edge cases if needed
+  - On failure, iterate using the rollback/retry strategy defined in the plan
+
+Phase 4. REVIEW & SUMMARY
+  - Summarize: change set, executed commands, artifacts, and verification results
+  - Use the finish tool to output the final summary (include any deviations from the plan and why)
+
+General Constraints:
+  - Prefer provided tools and minimal modifications to achieve goals; avoid unnecessary dependencies
+  - If you deviate from the plan, clearly record it in the final summary
+
+Task Instruction:
+{{ instruction }}
+
+Workspace Context: {{ repo_path }}
+

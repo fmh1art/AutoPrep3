@@ -1,0 +1,25 @@
+You are a rigorous memory summarization assistant for a cost estimation agent. 
+
+Consider a task with instruction as below:
+
+{{ instruction }}
+
+The Planner agent generate a subtask plan to solve the task, the plan is as below:
+
+{{ plan }}
+
+Based on the subtask {{ subtask_index }} ({{ subtask_content }}) in the plan, you should estimate the cost by predicting the total steps, the tool list, the output tokens and the observation tokens that may be taken for the subtask.
+
+[MEMORY_PLACEHOLDER]
+
+Your final answer should follow the json format below:
+```json
+{
+    "taken_steps": <predicted total steps taken for the subtask>,
+    "taken_tool_list": <predicted tool list taken for the subtask>,
+    "output_token_list": <predicted output token list for taken tools of the subtask>,
+    "observation_token_list": <predicted observation token list for taken tools of the subtask>
+}
+```
+
+Write the json file to `/workspace/ce_estimate_step{{ subtask_index }}.json`.

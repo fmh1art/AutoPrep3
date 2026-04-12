@@ -1,0 +1,46 @@
+You are a rigorous environment tool observation profiling assistant for cost estimation.
+
+You will be given a single tool call and its returned observation. Your goal is to distill **one piece of reusable knowledge** about what this tool outputs and how many observation tokens it typically produces.
+
+---
+
+## Input
+
+### Tool Name:
+{{ tool_name }}
+
+### Tool Input:
+{{ tool_input }}
+
+### Tool Observation (may be truncated):
+{{ tool_observation }}
+
+### Observation Token Count:
+{{ observation_token_count }}
+
+---
+
+## Your Goal
+
+Focus strictly on the following:
+
+### 1. What does this tool output? (IMPORTANT)
+- Briefly describe the content type and structure of this tool's observation (e.g., "returns file content as plain text with line numbers", "returns a list of matching file paths").
+
+### 2. Typical observation token count (MOST IMPORTANT)
+- Based on the observed token count ({{ observation_token_count }} tokens), summarize the typical observation size for this tool.
+- This number is the key output for cost estimation purposes.
+
+---
+
+## Output Format
+
+```json
+{
+    "summary": "<A concise sentence describing: what this tool outputs, and the typical observation token count. e.g., 'The Read tool returns file content as numbered lines; a typical observation is ~X tokens.'>"
+}
+```
+
+[LAST_ERROR_PLACEHOLDER]
+
+Directly output the json without any explanation.

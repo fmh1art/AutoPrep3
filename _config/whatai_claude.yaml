@@ -1,0 +1,8 @@
+key: sk-BzMx97xHrUYmbBLBcotVpNXsIY2rbw74pD6Xv4mmsISQwcTz
+llm_name: claude-sonnet-4-20250514
+openai_base_url: https://api.whatai.cc/v1
+
+price_dollar_per_token:
+  input_token: 0.000005
+  output_token: 0.000025
+  cached_token: 0.0000005
