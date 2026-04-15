@@ -172,11 +172,107 @@ def load_case_data(case_dir: str):
     return data
 
 
+def _collect_global_tool_samples(case_dirs: list[str], samples_per_bucket: int = 3) -> dict[str, list[dict]]:
+    """Scan all cases and collect representative tool samples, deduplicated by tool name + token bucket.
+
+    Returns: {tool_name: [sample_dict, ...]}
+    Each sample_dict has keys: tool_name, tool_input, tool_observation, observation_token_count
+    """
+    tool_samples: dict[str, dict[str, list[dict]]] = {}
+
+    for case_dir in case_dirs:
+        data = load_case_data(case_dir)
+        if "execution_steps" not in data or "token_usage" not in data:
+            continue
+        tool_traj = build_tool_trajectory(data["execution_steps"], data["token_usage"])
+        for item in tool_traj:
+            tool_name = item["tool_name"]
+            obs_tokens = item["observation_token_count"]
+            if obs_tokens < 50:
+                bucket = "small"
+            elif obs_tokens < 500:
+                bucket = "medium"
+            elif obs_tokens < 2000:
+                bucket = "large"
+            else:
+                bucket = "xlarge"
+
+            if tool_name not in tool_samples:
+                tool_samples[tool_name] = {}
+            if bucket not in tool_samples[tool_name]:
+                tool_samples[tool_name][bucket] = []
+            if len(tool_samples[tool_name][bucket]) < samples_per_bucket:
+                tool_samples[tool_name][bucket].append({
+                    "tool_name": tool_name,
+                    "tool_input": item["tool_input"],
+                    "tool_observation": item["tool_observation"],
+                    "observation_token_count": item["observation_token_count"],
+                })
+
+    result: dict[str, list[dict]] = {}
+    for tool_name, buckets in tool_samples.items():
+        samples = []
+        for bucket_items in buckets.values():
+            samples.extend(bucket_items)
+        result[tool_name] = samples
+
+    return result
+
+
+def _summarize_tools_global(tool_samples: dict[str, list[dict]], cfg: dict) -> list[dict]:
+    """Summarize tool samples globally (once per sample), returning tool memory results."""
+    llm = SimpleAPICaller(
+        llm_name=cfg['llm_name'],
+        api_key=cfg['key'],
+        base_url=cfg['openai_base_url'],
+        api_version=cfg.get('api_version', None),
+    )
+
+    total_samples = sum(len(v) for v in tool_samples.values())
+    print(f"\n[Tool Dedup] Summarizing {total_samples} tool samples across {len(tool_samples)} tool types (instead of per-case)")
+
+    tool_results = []
+    for tool_name, samples in sorted(tool_samples.items()):
+        for si, sample in enumerate(samples):
+            label = f"{tool_name}" if len(samples) == 1 else f"{tool_name}[{si}]"
+            try:
+                prompt = render_j2('ce_memorize_tools.j2', context={
+                    "tool_name": sample["tool_name"],
+                    "tool_input": sample["tool_input"],
+                    "tool_observation": sample["tool_observation"],
+                    "observation_token_count": sample["observation_token_count"],
+                })
+                prompt = prompt.replace('[LAST_ERROR_PLACEHOLDER]\n\n', "")
+
+                answer = llm.chat(prompt)
+                parsed_answer = parse_any_string(answer, code_type='json')
+                answer_dict = json.loads(parsed_answer)
+
+                if not isinstance(answer_dict, dict):
+                    raise ValueError(f"Parsed answer is not a dictionary. Parsed answer: {answer_dict}")
+                if 'summary' not in answer_dict:
+                    raise ValueError(f"Parsed answer does not contain 'summary' key: {answer_dict}")
+
+                metric = llm.get_last_usage()
+                tm = {
+                    'input_token': metric.get('input_tokens', 0),
+                    'output_token': metric.get('output_tokens', 0),
+                    'cached_token': metric.get('cached_tokens', 0),
+                }
+                tool_results.append({"tool_name": tool_name, "summary_json": parsed_answer, "token_metrics": tm})
+                print(f"    [tool] {label}: summarized")
+            except Exception as e:
+                print(f"    [tool] {label}: ERROR - {e}")
+
+    return tool_results
+
+
 def _summarize_case(case_dir: str, cfg: dict):
     """Summarize a single case using a thread-local SimpleAPICaller.
 
     Returns a dict containing all summarize results for the case,
     or None if the case should be skipped.
+    Note: Tool summarization is done globally, not per-case.
     """
     case_id = os.path.basename(case_dir)
     data = load_case_data(case_dir)
@@ -261,6 +357,8 @@ def _summarize_case(case_dir: str, cfg: dict):
 
             if not isinstance(answer_dict, dict):
                 raise ValueError(f"Parsed answer is not a dictionary. Parsed answer: {answer_dict}")
+            if 'subtask_type' not in answer_dict:
+                raise ValueError(f"Parsed answer does not contain 'subtask_type' key: {answer_dict}")
             if 'knowledge' not in answer_dict:
                 raise ValueError(f"Parsed answer does not contain 'knowledge' key: {answer_dict}")
             if 'indicators' not in answer_dict:
@@ -269,7 +367,14 @@ def _summarize_case(case_dir: str, cfg: dict):
                 raise ValueError(f"Parsed answer's indicators indicate uncertainty factor exists but does not contain 'fluctuation_ratio' key: {answer_dict}")
             if answer_dict['indicators'].get('uncertainty_factor_exists') is True:
                 _normalize_fluctuation_ratio(answer_dict['indicators'])
-                parsed_answer = json.dumps(answer_dict, ensure_ascii=False)
+            uncertainty_val = answer_dict['indicators'].get('uncertainty')
+            if uncertainty_val is not None:
+                uncertainty_val = float(uncertainty_val)
+                uncertainty_val = max(0.0, min(1.0, uncertainty_val))
+                answer_dict['indicators']['uncertainty'] = round(uncertainty_val, 4)
+            else:
+                answer_dict['indicators']['uncertainty'] = 0.5 if answer_dict['indicators'].get('uncertainty_factor_exists') else 0.2
+            parsed_answer = json.dumps(answer_dict, ensure_ascii=False)
 
             metric = llm.get_last_usage()
             tm = {
@@ -315,49 +420,11 @@ def _summarize_case(case_dir: str, cfg: dict):
     except Exception as e:
         print(f"    [{case_id}] backbone: ERROR - {e}")
 
-    tool_results = []
-    tool_traj = build_tool_trajectory(exec_steps, token_usage)
-    seen_tools = set()
-    for item in tool_traj:
-        tool_name = item["tool_name"]
-        if tool_name in seen_tools:
-            continue
-        seen_tools.add(tool_name)
-        try:
-            prompt = render_j2('ce_memorize_tools.j2', context={
-                "tool_name": tool_name,
-                "tool_input": item["tool_input"],
-                "tool_observation": item["tool_observation"],
-                "observation_token_count": item["observation_token_count"],
-            })
-            prompt = prompt.replace('[LAST_ERROR_PLACEHOLDER]\n\n', "")
-
-            answer = llm.chat(prompt)
-            parsed_answer = parse_any_string(answer, code_type='json')
-            answer_dict = json.loads(parsed_answer)
-
-            if not isinstance(answer_dict, dict):
-                raise ValueError(f"Parsed answer is not a dictionary. Parsed answer: {answer_dict}")
-            if 'summary' not in answer_dict:
-                raise ValueError(f"Parsed answer does not contain 'summary' key: {answer_dict}")
-
-            metric = llm.get_last_usage()
-            tm = {
-                'input_token': metric.get('input_tokens', 0),
-                'output_token': metric.get('output_tokens', 0),
-                'cached_token': metric.get('cached_tokens', 0),
-            }
-            _accumulate_tokens(case_token_metrics, tm)
-            tool_results.append({"tool_name": tool_name, "summary_json": parsed_answer, "token_metrics": tm})
-            print(f"    [{case_id}] tool [{tool_name}]: summarized")
-        except Exception as e:
-            print(f"    [{case_id}] tool [{tool_name}]: ERROR - {e}")
-
     return {
         "case_id": case_id,
         "task_results": task_results,
         "backbone_result": backbone_result,
-        "tool_results": tool_results,
+        "tool_results": [],
         "token_metrics": case_token_metrics,
     }
 
@@ -377,6 +444,17 @@ def init_memory(log_dir: str, llm_config_path: str, memory_root: str, max_worker
 
     total_token_metrics = {"input_token": 0, "output_token": 0, "cached_token": 0}
 
+    # Phase 1: Global tool dedup - collect and summarize tools once
+    print("\n=== Phase 1: Global tool summarization (dedup) ===")
+    tool_samples = _collect_global_tool_samples(case_dirs, samples_per_bucket=3)
+    sample_counts = {k: len(v) for k, v in tool_samples.items()}
+    print(f"[Tool Dedup] Collected samples: {sample_counts}")
+    global_tool_results = _summarize_tools_global(tool_samples, cfg)
+    for tr in global_tool_results:
+        _accumulate_tokens(total_token_metrics, tr["token_metrics"])
+
+    # Phase 2: Per-case subtask + backbone summarization (parallel)
+    print("\n=== Phase 2: Per-case subtask + backbone summarization ===")
     case_summaries = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_case = {
@@ -395,8 +473,21 @@ def init_memory(log_dir: str, llm_config_path: str, memory_root: str, max_worker
 
     case_summaries.sort(key=lambda x: x["case_id"])
 
-    print(f"\nSummarization complete. Adding memories sequentially ...")
+    # Phase 3: Add all memories
+    print(f"\n=== Phase 3: Adding memories ===")
 
+    # 3a: Add global tool memories first
+    print("Adding global tool memories ...")
+    for tr in global_tool_results:
+        try:
+            result = memorizer.add_memory("environment", tr["summary_json"], use_judge=True, tool_name=tr["tool_name"])
+            if result.get("token_metrics"):
+                _accumulate_tokens(total_token_metrics, result["token_metrics"])
+            print(f"    [tool] {tr['tool_name']}: added={result['added']}, reason={result['reason']}")
+        except Exception as e:
+            print(f"    [tool] {tr['tool_name']}: add ERROR - {e}")
+
+    # 3b: Add per-case task + backbone memories
     for cs in case_summaries:
         case_id = cs["case_id"]
         _accumulate_tokens(total_token_metrics, cs["token_metrics"])
@@ -419,15 +510,6 @@ def init_memory(log_dir: str, llm_config_path: str, memory_root: str, max_worker
                 print(f"    [{case_id}] backbone: added={result['added']}, reason={result['reason']}")
             except Exception as e:
                 print(f"    [{case_id}] backbone: add ERROR - {e}")
-
-        for tr in cs["tool_results"]:
-            try:
-                result = memorizer.add_memory("environment", tr["summary_json"], use_judge=True, tool_name=tr["tool_name"])
-                if result.get("token_metrics"):
-                    _accumulate_tokens(total_token_metrics, result["token_metrics"])
-                print(f"    [{case_id}] tool [{tr['tool_name']}]: added={result['added']}, reason={result['reason']}")
-            except Exception as e:
-                print(f"    [{case_id}] tool [{tr['tool_name']}]: add ERROR - {e}")
 
     memorizer.save_memory()
     print(f"\nMemory saved to {memory_root}")
@@ -460,4 +542,4 @@ if __name__ == "__main__":
 
     init_memory(args.log_dir, args.llm_config, args.memory_root, max_workers=args.workers)
 
-# python -m example.init_memory --log_dir _tmp/parallel_2026-04-08_19-07-48/log --llm_config _config/doubao.yaml --memory_root _tmp/memory_ce --workers 32
+# python -m example.init_memory --log_dir _tmp/parallel_2026-04-12_10-37-20_kimi_64cases/log --llm_config _config/doubao.yaml --memory_root _tmp/memory_ce --workers 32

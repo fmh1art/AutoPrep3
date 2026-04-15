@@ -1,178 +1,213 @@
-# CE Result Evaluation Logic
-
-本文档介绍 Cost Estimation (CE) 结果精度评估的逻辑实现。
+# Cost Estimation (CE) 精度评估指标说明
 
 ## 概述
 
-CE 结果评估用于对比 CE Agent 预测的 token 消耗与真实运行的 token 消耗，计算各种精度指标。评估逻辑位于 `ce_estimate_runner.py` 的 `evaluate()` 函数中。
+本文档介绍CE（Cost Estimation）模块用于评估成本预测准确性的各项指标，结合我们的场景说明各指标的含义和合适的数值范围。
 
-## 输入数据
+## 核心概念
 
-评估函数从 `ce_result_dir` 目录读取以下文件：
+在CE场景中，我们的目标是：
+- 预测每个subtask的执行成本（以美元为单位）
+- 预测每个case（完整任务）的总成本
+- 通过准确的成本预测来选择最优plan
 
-- **instance_id.json**：每个 case 的 CE 预测结果，包含：
-  - `ce_results`：每个 subtask 的预测数据
-  - `ground_truth`：每个 subtask 的真实 token 数据
-  - `ce_metrics`：CE 运行过程中的 token 消耗
+评估维度分为两个层级：
+1. **Subtask-level**: 子任务级别的预测精度
+2. **Case-level**: 完整任务级别的预测精度
 
-## 成本计算
+---
 
-### 单价设置
+## 指标详解
 
-默认使用以下 token 单价（可自定义）：
+### 1. APE (Absolute Percentage Error) - 绝对百分比误差
 
-- `inp_price = 3`：未缓存输入 token 单价（每 1M tokens）
-- `out_price = 15`：输出 token 单价（每 1M tokens）
-- `cache_price = 1`：已缓存输入 token 单价（每 1M tokens）
-
-### 成本计算函数
-
-使用 `_subtask_cost()` 函数计算单个 subtask 的成本：
-
-```python
-def _subtask_cost(token_lis, inp_price, out_price, cache_price):
-    return calculate_multi_step_cost_without_prefix(
-        token_lis, inp_price, out_price, cache_price
-    )
+**计算公式**：
+```
+APE = |预测值 - 真实值| / 真实值
 ```
 
-该函数考虑了步骤之间的 prefix 累积关系，计算真实的成本消耗。
+**含义**：
+- 表示预测值相对于真实值的误差百分比
+- 值越小越好，0表示完美预测
+- 例如：真实成本$1.0，预测$1.2，APE=20%
 
-## 评估流程
+**在我们的场景中**：
+- 用于衡量单个subtask或单个case的成本预测误差
+- 对所有subtask计算APE后，可以进行聚合统计
 
-### 1. 数据过滤
+---
 
-评估函数会跳过以下 case：
+### 2. MAPE (Mean Absolute Percentage Error) - 平均绝对百分比误差
 
-- 有 `error` 字段的 case
-- 缺少 `ce_results` 或 `ground_truth` 的 case
-- subtask 预测有 `error` 的 subtask
-- 缺少真实 token 数据的 subtask
-
-### 2. Subtask 级别评估
-
-对每个有效的 subtask，计算以下指标：
-
-| 指标 | 计算公式 | 说明 |
-|------|---------|------|
-| `pred_cost` | 通过 `_subtask_cost()` 计算 | 预测成本 |
-| `gt_cost` | 通过 `_subtask_cost()` 计算 | 真实成本 |
-| `absolute_percentage_error (APE)` | `\|pred_cost - gt_cost\| / gt_cost` | 绝对百分比误差 |
-| `ratio_pred_over_gt` | `pred_cost / gt_cost` | 预测与真实值比值 |
-
-**边界情况处理**：
-- 如果 `gt_cost = 0` 且 `pred_cost > 0`：`APE = inf`
-- 如果 `gt_cost = 0` 且 `pred_cost = 0`：`APE = 0`
-
-### 3. Case 级别评估
-
-对每个有效的 case，计算以下指标：
-
-| 指标 | 说明 |
-|------|------|
-| `pred_total_cost` | 该 case 所有 subtask 预测成本之和 |
-| `gt_total_cost` | 该 case 所有 subtask 真实成本之和 |
-| `case_absolute_percentage_error` | case 级别的 APE |
-| `case_ratio_pred_over_gt` | case 级别的比值 |
-| `subtask_mean_ape` | 该 case 内所有 subtask APE 的平均值 |
-
-### 4. 聚合指标
-
-#### Subtask 级别聚合
-
-对所有 subtask 的 APE 计算以下统计量：
-
-| 指标 | 说明 |
-|------|------|
-| `count` | 评估的 subtask 数量 |
-| `mape` | Mean Absolute Percentage Error，平均绝对百分比误差 |
-| `median_ape` | APE 的中位数 |
-| `mae_of_ape` | APE 的标准差（注：实际代码中计算的是 std） |
-| `min_ape` | 最小 APE |
-| `max_ape` | 最大 APE |
-| `pct_within_50` | APE ≤ 50% 的 subtask 占比 |
-| `pct_within_100` | APE ≤ 100% 的 subtask 占比 |
-
-#### Case 级别聚合
-
-对所有 case 的 APE 计算与 subtask 级别相同的统计量，此外还计算：
-
-| 指标 | 说明 |
-|------|------|
-| `pearson_corr` | 预测成本与真实成本的 Pearson 相关系数（需要 ≥ 2 个 case） |
-
-## 输出
-
-### 1. 控制台输出
-
-打印评估摘要，格式如下：
-
+**计算公式**：
 ```
-============================================================
-CE Evaluation Summary
-============================================================
-Cases evaluated: 6
-
-[Subtask-level]  count=30  MAPE=123.45%  median_APE=45.67%  within_50%=50.00%
-[Case-level]     count=6  MAPE=98.76%  median_APE=67.89%  within_50%=33.33%
-                 Pearson correlation (pred vs gt): 0.8765
-============================================================
+MAPE = mean(APE₁, APE₂, ..., APEₙ)
 ```
 
-### 2. JSON 文件输出
+**含义**：
+- 所有样本APE的平均值
+- 反映整体预测的平均误差水平
+- 值越小越好
 
-评估结果保存为 `eval_result.json`，结构如下：
+**合适的值**：
+| 精度等级 | MAPE范围 | 说明 |
+|---------|----------|------|
+| 优秀 | < 30% | 预测非常准确 |
+| 良好 | 30% - 50% | 预测较为准确 |
+| 一般 | 50% - 100% | 预测有一定误差但可用 |
+| 较差 | > 100% | 预测误差较大 |
 
-```json
-{
-  "case_details": [
-    {
-      "instance_id": "repo__issue-id",
-      "pred_total_cost": 1234.56,
-      "gt_total_cost": 987.65,
-      "case_absolute_percentage_error": 0.25,
-      "case_ratio_pred_over_gt": 1.25,
-      "num_subtasks_evaluated": 5,
-      "subtask_mean_ape": 0.30,
-      "subtasks": [
-        {
-          "subtask_idx": 0,
-          "title": "Subtask title",
-          "pred_cost": 123.45,
-          "gt_cost": 98.76,
-          "absolute_percentage_error": 0.25,
-          "ratio_pred_over_gt": 1.25
-        }
-      ]
-    }
-  ],
-  "subtask_aggregate": {
-    "count": 30,
-    "mape": 1.2345,
-    "median_ape": 0.4567,
-    "mae_of_ape": 0.8765,
-    "min_ape": 0.01,
-    "max_ape": 5.67,
-    "pct_within_50": 0.5,
-    "pct_within_100": 0.7
-  },
-  "case_aggregate": {
-    "count": 6,
-    "mape": 0.9876,
-    "median_ape": 0.6789,
-    "mae_of_ape": 0.5432,
-    "min_ape": 0.1,
-    "max_ape": 2.34,
-    "pct_within_50": 0.3333,
-    "pct_within_100": 0.6667,
-    "pearson_corr": 0.8765
-  }
-}
+**在我们的场景中**：
+- Subtask-level MAPE：衡量所有子任务成本预测的平均误差
+- Case-level MAPE：衡量所有完整任务成本预测的平均误差
+- 由于成本预测的难度（需要预估步骤数、工具调用、token消耗），MAPE在50%以内可以认为是可接受的
+
+---
+
+### 3. Median APE - 中位数绝对百分比误差
+
+**计算公式**：
+```
+Median APE = median(APE₁, APE₂, ..., APEₙ)
 ```
 
-## 关键代码位置
+**含义**：
+- 所有样本APE的中位数
+- 比MAPE更稳健，不受极端值影响
+- 值越小越好
 
-- **主评估函数**：`ce_estimate_runner.py:260-434`
-- **成本计算**：`ce_estimate_runner.py:251-257`
-- **聚合指标计算**：`ce_estimate_runner.py:383-396`
-- **结果保存**：`ce_estimate_runner.py:428-432`
+**合适的值**：
+参考MAPE的范围，通常Median APE会略低于MAPE。
+
+**在我们的场景中**：
+- 当某些subtask的预测误差特别大时，Median APE能更好地反映典型预测精度
+- 例如：如果50%的subtask预测误差在80%以内，说明至少一半的预测是相对可靠的
+
+---
+
+### 4. Within 50% - 误差在50%以内的比例
+
+**计算公式**：
+```
+Within 50% = (APE ≤ 0.5的样本数) / 总样本数
+```
+
+**含义**：
+- 预测误差在50%以内的样本占比
+- 值越大越好，100%表示所有预测误差都在50%以内
+
+**合适的值**：
+| 精度等级 | Within 50% | 说明 |
+|---------|------------|------|
+| 优秀 | > 60% | 大部分预测都很准确 |
+| 良好 | 40% - 60% | 近半数预测准确 |
+| 一般 | 20% - 40% | 部分预测准确 |
+| 较差 | < 20% | 很少有预测准确 |
+
+**在我们的场景中**：
+- 这是一个非常实用的指标，因为我们使用CE来选择plan
+- 如果Within 50%达到40%以上，说明有相当比例的subtask成本预测是相对可靠的
+- 只要能相对准确地比较不同plan的成本高低，即使绝对误差较大，也能起到选择作用
+
+---
+
+### 5. Pearson Correlation - 皮尔逊相关系数
+
+**计算公式**：
+```
+Pearson Correlation = cov(预测值, 真实值) / (std(预测值) * std(真实值))
+```
+
+**取值范围**：[-1, 1]
+
+**含义**：
+- 衡量预测值与真实值之间的线性相关程度
+- 1表示完全正相关，-1表示完全负相关，0表示无相关性
+- 对于我们的场景，值越接近1越好
+
+**合适的值**：
+| 相关程度 | Pearson Correlation | 说明 |
+|---------|---------------------|------|
+| 强相关 | > 0.7 | 预测能很好地反映真实成本趋势 |
+| 中等相关 | 0.4 - 0.7 | 预测有一定参考价值 |
+| 弱相关 | 0.1 - 0.4 | 预测参考价值有限 |
+| 无相关/负相关 | < 0.1 | 预测几乎不可用 |
+
+**在我们的场景中**：
+- 这是最重要的指标之一！因为我们使用CE来**比较不同plan的成本**，而不是精确预测绝对值
+- 只要预测值与真实值正相关，即使绝对误差较大，也能正确选择成本较低的plan
+- 例如：如果Plan A真实成本$1.0，Plan B真实成本$2.0，只要预测值也是Plan A < Plan B，就能做出正确选择
+- 负相关是最坏的情况，会导致选择成本最高的plan
+
+---
+
+## 实际案例分析
+
+根据我们的实验结果：
+
+### Without Memory 版本
+```
+[Subtask-level]  count=49  MAPE=inf%  median_APE=82.14%  within_50%=16.33%
+[Case-level]     count=12  MAPE=72.36%  median_APE=74.17%  within_50%=25.00%
+                 Pearson correlation (pred vs gt): -0.4989
+```
+
+**评价**：
+- Subtask-level MAPE为inf说明有个别subtask的真实成本接近0，导致APE无穷大
+- median_APE=82.14%和within_50%=16.33%说明预测精度较差
+- Case-level MAPE=72.36%，误差较大
+- **最严重的问题**：Pearson correlation=-0.4989（负相关），这意味着预测值和真实值趋势相反，会导致选择错误的plan！
+
+### With Memory 版本
+```
+[Subtask-level]  count=49  MAPE=inf%  median_APE=80.24%  within_50%=20.41%
+[Case-level]     count=12  MAPE=53.94%  median_APE=54.25%  within_50%=41.67%
+                 Pearson correlation (pred vs gt): -0.3378
+```
+
+**评价**：
+- 相比Without Memory版本，各项指标都有改善
+- Case-level MAPE从72.36%下降到53.94%
+- Case-level within_50%从25.00%提升到41.67%
+- Pearson correlation从-0.4989改善到-0.3378（负相关性减弱）
+- **结论**：With Memory版本预测更准确，但Pearson correlation仍然为负，还需要进一步改进
+
+---
+
+## 针对我们场景的建议
+
+### 优先级排序
+
+在CE场景中，指标的重要性排序：
+
+1. **Pearson Correlation** > **Within 50%** > **Median APE** > **MAPE**
+
+理由：
+- Pearson Correlation决定了能否正确选择成本较低的plan，这是CE的核心目标
+- Within 50%告诉我们有多少预测是相对可靠的
+- Median APE和MAPE反映绝对误差，但在选择plan时相对不那么重要
+
+### 可接受的阈值
+
+| 指标 | 最低要求 | 理想目标 |
+|-----|---------|---------|
+| Pearson Correlation | > 0.3 | > 0.6 |
+| Case-level Within 50% | > 30% | > 50% |
+| Case-level Median APE | < 60% | < 40% |
+
+### 关键警示
+
+如果出现以下情况，CE模块不可用：
+- Pearson Correlation < 0（负相关）
+- Case-level Within 50% < 20%
+
+---
+
+## 总结
+
+CE精度评估需要综合多个指标：
+- **Pearson Correlation**：判断预测趋势是否正确（最重要）
+- **Within 50%**：判断有多少预测相对可靠
+- **Median APE / MAPE**：判断绝对误差大小
+
+在我们的场景中，即使绝对误差较大，只要Pearson Correlation为正且足够大，CE就能有效帮助选择最优plan。

@@ -1126,7 +1126,7 @@ if __name__ == "__main__":  # pragma: no cover
 运行示例：
 
 1) 生成所有实例的 subtasks 并批量分类（会写回各 case 目录）：
-   python example/cost_estimation/cal_cost.py parallel_2026-04-11_21-55-36 --ce-dir _tmp/parallel_2026-04-11_21-55-36/ce_result
+   python example/cost_estimation/cal_cost.py parallel_2026-04-12_10-37-20_kimi_64cases --ce-dir _tmp/parallel_2026-04-12_10-37-20_kimi_64cases/ce_result
 
 依赖：_config/doubao.yaml 中需提供 openai 兼容配置：
    llm_name: <model>

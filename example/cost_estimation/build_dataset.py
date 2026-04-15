@@ -400,7 +400,7 @@ if __name__ == "__main__":  # pragma: no cover
 用法示例：
 
 1) 构造数据集到默认位置：
-   python example/cost_estimation/build_dataset.py parallel_2026-04-11_21-55-36
+   python example/cost_estimation/build_dataset.py parallel_2026-04-12_10-37-20_kimi_64cases
 
 2) 指定 _tmp 根目录：
    python example/cost_estimation/build_dataset.py parallel_2026-04-08_00-16-16 --tmp-root _tmp
