@@ -121,9 +121,8 @@ def run_single_ce(args_dict: dict) -> dict:
     instance_id = meta["instance_id"]
     logger.info(f"[CE Worker] Starting {instance_id}")
 
-    workspace = None
     try:
-        # 1. 找到对应的 SWE-bench 实例
+        # 1. 找到对应的 SWE-bench 实例（主要用于获取元数据）
         runner = SweBenchRunner(**runner_config)
         instances = runner.prepare_instances(
             dataset=args_dict["swe_dataset"],
@@ -137,69 +136,50 @@ def run_single_ce(args_dict: dict) -> dict:
         if ins is None:
             raise ValueError(f"Instance {instance_id} not found in SWE-bench dataset")
 
-        # 2. 准备 workspace 并克隆仓库
-        workspace = runner.prepare_workspace(instance=ins)
-        repo_url = f"https://github.com/{ins['repo']}.git"
-        base_commit = ins["base_commit"]
+        # 2. 构造 instruction（虽然新的CEAgent可能不需要，但保留用于兼容性）
         repo_name = ins["repo"].split("/")[-1]
         repo_path = meta.get("repo_path") or f"/workspace/{repo_name}"
-        repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
-
-        clone_result = workspace.execute_command(
-            f"rm -rf {repo_path} && "
-            f"git init {repo_path} && "
-            f"cd {repo_path} && "
-            f"git remote add origin {repo_url} && "
-            f"git fetch --depth 1 origin {base_commit}",
-            timeout=float(repo_prepare_timeout),
-        )
-        if clone_result.exit_code != 0:
-            raise RuntimeError(f"Clone failed: {clone_result.stdout}")
-
-        checkout_result = workspace.execute_command(
-            f"cd {repo_path} && git checkout --detach FETCH_HEAD",
-            timeout=120.0,
-        )
-        if checkout_result.exit_code != 0:
-            raise RuntimeError(f"Checkout failed: {checkout_result.stdout}")
-
-        # 3. 构造 instruction
         instruction = render_j2(
             template_name="query.j2",
             context={
                 "repo_path": repo_path,
                 "problem_statement": str(ins.get("problem_statement", "")).strip(),
-                "base_commit": base_commit,
+                "base_commit": ins["base_commit"],
             },
         )
 
-        # 4. 构造 subtasks 输入并调用 CEAgent
+        # 3. 构造 subtasks 输入并调用 CEAgent
         ce_subtasks = _build_ce_input_subtasks(data_item["subtasks"])
 
         cfg = yaml.safe_load(open(args_dict["exp_config"], "r", encoding="utf-8"))
-        llm = LLM(
-            model=f"openai/{cfg['llm_name']}",
-            api_key=cfg["key"],
-            base_url=cfg["openai_base_url"],
-            api_version=cfg.get("api_version"),
-        )
-        agent = CEAgent(llm=llm)
+        
+        # 构建 ce_cfg
+        ce_cfg = {
+            "llm_name": cfg["llm_name"],
+            "key": cfg["key"],
+            "openai_base_url": cfg["openai_base_url"],
+            "api_version": cfg.get("api_version"),
+        }
+        
+        # 构建 executor_price
+        executor_price = cfg.get("price_dollar_per_token", {
+            "input_token": 3e-6,
+            "output_token": 15e-6,
+            "cached_token": 1e-6,
+        })
+        
+        agent = CEAgent(ce_cfg=ce_cfg, executor_price=executor_price)
         result = agent.estimate_cost(
             instruction=instruction,
             subtasks=ce_subtasks,
-            workspace=workspace,
         )
 
-        # 5. 构造 ground truth
+        # 4. 构造 ground truth
         ground_truth = _build_ground_truth(data_item["subtasks"], save_gt_tokens=save_gt_tokens)
 
-        # 6. 提取 metrics
-        ce_metrics = result.metrics if hasattr(result, "metrics") else {}
-        ce_results = (
-            result.other_content.get("ce_results", [])
-            if hasattr(result, "other_content")
-            else []
-        )
+        # 5. 提取 metrics 和 results
+        ce_metrics = result.get("ce_metrics", {})
+        ce_results = result.get("ce_results", [])
 
         # 7. 保存结果
         output = {
@@ -236,12 +216,6 @@ def run_single_ce(args_dict: dict) -> dict:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(error_output, f, ensure_ascii=False, indent=2)
         return error_output
-    finally:
-        if workspace is not None:
-            try:
-                workspace.cleanup()
-            except Exception as cleanup_err:
-                logger.warning(f"[CE Worker] Cleanup failed for {instance_id}: {cleanup_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -334,16 +308,16 @@ def evaluate(
             pred_cost = _subtask_cost(pred_token_lis, inp_price, out_price, cache_price)
             gt_cost = _subtask_cost(gt_token_lis, inp_price, out_price, cache_price)
 
+            # 如果真实cost为0，跳过该subtask的评估
+            if gt_cost <= 0:
+                continue
+
             pred_case_cost += pred_cost
             gt_case_cost += gt_cost
 
             # subtask 级别指标
-            if gt_cost > 0:
-                ape = abs(pred_cost - gt_cost) / gt_cost
-                ratio = pred_cost / gt_cost
-            else:
-                ape = float("inf") if pred_cost > 0 else 0.0
-                ratio = float("inf") if pred_cost > 0 else 1.0
+            ape = abs(pred_cost - gt_cost) / gt_cost
+            ratio = pred_cost / gt_cost
 
             subtask_eval = {
                 "subtask_idx": idx,
@@ -359,13 +333,12 @@ def evaluate(
         if not subtask_evals:
             continue
 
-        # case 级别指标
-        if gt_case_cost > 0:
-            case_ape = abs(pred_case_cost - gt_case_cost) / gt_case_cost
-            case_ratio = pred_case_cost / gt_case_cost
-        else:
-            case_ape = float("inf") if pred_case_cost > 0 else 0.0
-            case_ratio = float("inf") if pred_case_cost > 0 else 1.0
+        # case 级别指标：如果真实case cost为0，跳过该case的评估
+        if gt_case_cost <= 0:
+            continue
+
+        case_ape = abs(pred_case_cost - gt_case_cost) / gt_case_cost
+        case_ratio = pred_case_cost / gt_case_cost
 
         case_details.append({
             "instance_id": instance_id,

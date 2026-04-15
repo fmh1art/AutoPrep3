@@ -79,6 +79,8 @@ def main():
     parser.add_argument("--use-fcm", action="store_true", help="使用FCM Agent")
     parser.add_argument("--use-reflection", action="store_true", help="使用Reflection Agent")
     parser.add_argument("--use-plan-mode", action="store_true", help="使用Plan-Execution Agent")
+    parser.add_argument("--use-cost-estimation", action="store_true", help="使用Cost Estimation优化plan选择")
+    parser.add_argument("--num-candidate-plans", type=int, default=3, help="候选plan数量")
     parser.add_argument("--prompt-path", type=str, default="./src/prompts/query.j2", help="Prompt模板")
     parser.add_argument("--parallel", type=int, default=8, help="并行数")
     parser.add_argument("--output-dir", type=str, default=None, help="输出目录")
@@ -117,6 +119,8 @@ def main():
         "use_reflection": args.use_reflection,
         "use_fcm": args.use_fcm,
         "use_plan_mode": args.use_plan_mode,
+        "use_cost_estimation": args.use_cost_estimation,
+        "num_candidate_plans": args.num_candidate_plans,
     }
     logger.info(f"Runner config: {runner_config}")  # Log the runner configuration for debugging
 
@@ -136,13 +140,22 @@ def main():
 
     # 并行执行
     results = []
+    worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))  # 默认2小时超时
     with ProcessPoolExecutor(max_workers=args.parallel) as executor:
         futures = {executor.submit(run_single_instance, task): task for task in tasks}
         for future in as_completed(futures):
             task = futures[future]
             instance_id = task["instance"]["instance_id"]
             try:
-                result = future.result()
+                result = future.result(timeout=worker_timeout)
+            except TimeoutError:
+                logger.error(f"[Worker] Timeout for {instance_id} after {worker_timeout}s")
+                result = {
+                    "instance_id": instance_id,
+                    "error": f"Worker timeout after {worker_timeout}s",
+                    "resolved": False,
+                }
+                future.cancel()
             except Exception as e:
                 logger.error(f"[Worker] Future failed for {instance_id}: {e}")
                 import traceback

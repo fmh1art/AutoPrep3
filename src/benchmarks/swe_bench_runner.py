@@ -278,6 +278,8 @@ class SweBenchRunner:
         use_reflection: bool = False,
         use_fcm: bool = False,
         use_plan_mode: bool = False,
+        use_cost_estimation: bool = False,
+        num_candidate_plans: int = 3,
     ):
         exp_model_name = exp_cfg['llm_name']
         exp_api_key = exp_cfg['key']
@@ -309,10 +311,14 @@ class SweBenchRunner:
         self.tmp_root = tmp_root
         self.prompt_path = prompt_path
         self.http_proxy = http_proxy
-        self.no_proxy = no_proxy or "localhost,127.0.0.1,::1"
+        self.no_proxy = no_proxy or "localhost,127.0.0.1::1"
         self.use_reflection = use_reflection
         self.use_fcm = use_fcm
         self.use_plan_mode = use_plan_mode
+        self.use_cost_estimation = use_cost_estimation
+        self.num_candidate_plans = num_candidate_plans
+        self.exp_cfg = exp_cfg
+        self.cheap_exp_cfg = cheap_exp_cfg
         self.main_log_path = configure_main_logger(self.tmp_root)
         self._setup_proxy_env()
 
@@ -529,9 +535,17 @@ class SweBenchRunner:
             # ── 使用 CodeAgent 运行对话 ───────────────────────────────────────
             if self.use_plan_mode:
                 logger.info(f"Using CodeAgentPlanMode for {instance_id}")
+                ce_cfg = self.cheap_exp_cfg if self.use_cost_estimation else None
+                executor_price = self.exp_cfg.get('price_dollar_per_token', {
+                    "input_token": 1.143e-07,
+                    "output_token": 2.857e-07,
+                    "cached_token": 4.57e-08,
+                })
                 code_agent = CodeAgentPlanMode(
-                    planner_llm=self.cheap_llm,
+                    planner_cfg=self.cheap_exp_cfg,
                     executor_llm=self.exp_llm,
+                    ce_cfg=ce_cfg,
+                    executor_price=executor_price,
                     tools=self.tools,
                 )
                 agent_result = code_agent.run(
@@ -546,6 +560,7 @@ class SweBenchRunner:
                     execution_trajectory_path=os.path.join(
                         log_dir, f"{instance_id}_execution_trajectory.md"
                     ),
+                    num_candidate_plans=self.num_candidate_plans,
                 )
             elif self.use_fcm:
                 logger.info(f"Using CodeAgentWithFCM for {instance_id}")
