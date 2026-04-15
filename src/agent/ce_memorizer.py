@@ -81,6 +81,8 @@ class CEMemorizer:
         def check_parsed_answer_structure(answer_dict):
             if not isinstance(answer_dict, dict):
                 raise ValueError(f"Parsed answer is not a dictionary. Parsed answer: {answer_dict}")
+            if 'subtask_type' not in answer_dict:
+                raise ValueError(f"Parsed answer does not contain 'subtask_type' key: {answer_dict}")
             if 'knowledge' not in answer_dict:
                 raise ValueError(f"Parsed answer does not contain 'knowledge' key: {answer_dict}")
             if 'indicators' not in answer_dict:
@@ -91,6 +93,13 @@ class CEMemorizer:
                 raise ValueError(f"Parsed answer's indicators indicate uncertainty factor exists but does not contain 'fluctuation_ratio' key: {answer_dict}")
             if answer_dict['indicators'].get('uncertainty_factor_exists') is True:
                 _normalize_fluctuation_ratio(answer_dict['indicators'])
+            uncertainty_val = answer_dict['indicators'].get('uncertainty')
+            if uncertainty_val is not None:
+                uncertainty_val = float(uncertainty_val)
+                uncertainty_val = max(0.0, min(1.0, uncertainty_val))
+                answer_dict['indicators']['uncertainty'] = round(uncertainty_val, 4)
+            else:
+                answer_dict['indicators']['uncertainty'] = 0.5 if answer_dict['indicators'].get('uncertainty_factor_exists') else 0.2
 
         check_parsed_answer_structure(answer_dict)
         parsed_answer = json.dumps(answer_dict, ensure_ascii=False)

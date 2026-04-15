@@ -39,6 +39,7 @@ class SimpleAPICaller:
                 api_key=self.api_key,
                 azure_endpoint=self.base_url,
                 api_version=self.api_version,
+                timeout=600,
             )
         else:
             # OpenAI / OpenAI 兼容服务（例如 one-api、自建网关等）
@@ -60,6 +61,10 @@ class SimpleAPICaller:
         # 兼容传入 str 的场景
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
+
+        # 如果没有传入 timeout 参数，使用默认值
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = 600
 
         completion = self.client.chat.completions.create(
             model=self.llm_name,
