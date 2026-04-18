@@ -47,7 +47,7 @@ class OperatorCEAgent:
         except Exception:
             memorizer_cfg = self.llm_configs.get("B", {})
 
-        for backbone in [LLMBackbone.A, LLMBackbone.B, LLMBackbone.C]:
+        for backbone in LLMBackbone.available_backbones():
             mem_dir = os.path.join(self.memory_root, f"backbone_{backbone.value}")
             self.memorizers[backbone.value] = CEMemorizer(
                 cfg=memorizer_cfg,
@@ -185,6 +185,14 @@ class OperatorCEAgent:
         assert ce_result is not None
         return ce_result
 
+    def _get_llm_backbone(self) -> str:
+        llm_name = self.caller.llm_name.lower()
+        if "flash" in llm_name or "doubao_flash" in llm_name or "lite" in llm_name:
+            return "A"
+        if "kimi" in llm_name:
+            return "C"
+        return "B"
+
     def estimate_plan(
         self,
         instruction: str,
@@ -222,6 +230,8 @@ class OperatorCEAgent:
             "cache_read_tokens": usage_after["cached_tokens"] - usage_before["cached_tokens"],
             "reasoning_tokens": usage_after["reasoning_tokens"] - usage_before["reasoning_tokens"],
             "total_tokens": usage_after["total_tokens"] - usage_before["total_tokens"],
+            "accumulated_cost": 0.0,
+            "llm_backbone": self._get_llm_backbone(),
         }
 
         return ce_results, metrics

@@ -38,24 +38,37 @@ class LLMBackbone(str, Enum):
         }
         return mapping.get(name.lower().replace(" ", "-"), LLMBackbone.B)
 
+    @staticmethod
+    def available_backbones() -> list["LLMBackbone"]:
+        return [LLMBackbone.A, LLMBackbone.B]
+
+    @staticmethod
+    def max_backbone() -> "LLMBackbone":
+        available = LLMBackbone.available_backbones()
+        return max(available, key=lambda b: b.price_tier)
+
 
 @dataclass
 class Operator:
     index: int
     subtask: str
-    llm_backbone: LLMBackbone = LLMBackbone.B
+    llm_backbone: LLMBackbone | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "index": self.index,
             "subtask": self.subtask,
-            "llm_backbone": self.llm_backbone.value,
         }
+        if self.llm_backbone is not None:
+            d["llm_backbone"] = self.llm_backbone.value
+        return d
 
     @staticmethod
     def from_dict(d: dict[str, Any]) -> "Operator":
-        backbone = d.get("llm_backbone", "B")
-        if isinstance(backbone, str) and backbone in ("A", "B", "C"):
+        backbone = d.get("llm_backbone")
+        if backbone is None:
+            backbone = None
+        elif isinstance(backbone, str) and backbone in ("A", "B", "C"):
             backbone = LLMBackbone(backbone)
         elif isinstance(backbone, str):
             backbone = LLMBackbone.from_display_name(backbone)
@@ -68,7 +81,9 @@ class Operator:
         )
 
     def serialize_for_prompt(self) -> str:
-        return f"[Op {self.index}] (Model {self.llm_backbone.value}={self.llm_backbone.display_name}) {self.subtask}"
+        if self.llm_backbone is not None:
+            return f"[Op {self.index}] (Model {self.llm_backbone.value}={self.llm_backbone.display_name}) {self.subtask}"
+        return f"[Op {self.index}] {self.subtask}"
 
 
 @dataclass
@@ -90,7 +105,11 @@ class OperatorPlan:
         for op in self.operators:
             lines.append(op.serialize_for_prompt())
         lines.append("")
-        lines.append("Model Legend: A=doubao-flash (cheapest), B=doubao (medium), C=kimi-k2.5 (strongest)")
+        available = LLMBackbone.available_backbones()
+        if LLMBackbone.C in available:
+            lines.append("Model Legend: A=doubao-flash (cheapest), B=doubao (medium), C=kimi-k2.5 (strongest)")
+        else:
+            lines.append("Model Legend: A=doubao-flash (cheapest), B=doubao (strongest)")
         return "\n".join(lines)
 
     def serialize_for_execution(self) -> str:
@@ -98,9 +117,12 @@ class OperatorPlan:
             return "(empty plan)"
         lines = [f"### Operator Execution Plan ({len(self.operators)} operators)", ""]
         for op in self.operators:
-            lines.append(
-                f"{op.index}. [Using {op.llm_backbone.display_name}] {op.subtask}"
-            )
+            if op.llm_backbone is not None:
+                lines.append(
+                    f"{op.index}. [Using {op.llm_backbone.display_name}] {op.subtask}"
+                )
+            else:
+                lines.append(f"{op.index}. {op.subtask}")
         return "\n".join(lines)
 
     def reindex(self) -> "OperatorPlan":

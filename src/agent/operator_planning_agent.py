@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 class OperatorPlanningAgent:
     def __init__(self, planner_cfg: dict):
+        self.planner_cfg = planner_cfg
         self.caller = SimpleAPICaller(
             llm_name=planner_cfg["llm_name"],
             api_key=planner_cfg["key"],
@@ -22,12 +23,22 @@ class OperatorPlanningAgent:
             api_version=planner_cfg.get("api_version"),
         )
 
+    def _get_llm_backbone(self) -> str:
+        llm_name = self.planner_cfg.get("llm_name", "").lower()
+        if "flash" in llm_name or "doubao_flash" in llm_name or "lite" in llm_name:
+            return "A"
+        if "kimi" in llm_name:
+            return "C"
+        return "B"
+
     def generate_plan(
         self,
         instruction: str,
         workspace_overview: str = "",
         max_attempts: int = 3,
-    ) -> OperatorPlan:
+    ) -> tuple[OperatorPlan, dict[str, Any]]:
+        usage_before = self.caller.get_total_usage()
+
         prompt = render_j2(
             "operator_planning.j2",
             context={
@@ -40,6 +51,7 @@ class OperatorPlanningAgent:
             logger.info(f"Operator planning prompt: {prompt[:2000]}")
 
         messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
+        raw_response = ""
 
         for attempt in range(1, max_attempts + 1):
             try:
@@ -51,7 +63,8 @@ class OperatorPlanningAgent:
                         f"Operator plan generated: {len(plan.operators)} operators, "
                         f"backbone distribution: {self._backbone_distribution(plan)}"
                     )
-                    return plan
+                    metrics = self._compute_metrics(usage_before)
+                    return plan, metrics
             except Exception as e:
                 logger.error(f"Planning attempt {attempt} failed: {e}")
 
@@ -63,12 +76,25 @@ class OperatorPlanningAgent:
                         "Your previous response could not be parsed as valid JSON. "
                         "Please output the operator plan again as a valid JSON code block "
                         "(```json ... ```). Each operator must have 'index', 'subtask', and "
-                        "'llm_backbone' (one of 'A', 'B', 'C') fields."
+                        "'llm_backbone' (one of 'A', 'B') fields."
                     ),
                 })
 
         logger.warning("All planning attempts failed, using fallback plan")
-        return self._fallback_plan()
+        metrics = self._compute_metrics(usage_before)
+        return self._fallback_plan(), metrics
+
+    def _compute_metrics(self, usage_before: dict) -> dict[str, Any]:
+        usage_after = self.caller.get_total_usage()
+        return {
+            "prompt_tokens": usage_after["input_tokens"] - usage_before["input_tokens"],
+            "completion_tokens": usage_after["output_tokens"] - usage_before["output_tokens"],
+            "cache_read_tokens": usage_after["cached_tokens"] - usage_before["cached_tokens"],
+            "reasoning_tokens": usage_after["reasoning_tokens"] - usage_before["reasoning_tokens"],
+            "total_tokens": usage_after["total_tokens"] - usage_before["total_tokens"],
+            "accumulated_cost": 0.0,
+            "llm_backbone": self._get_llm_backbone(),
+        }
 
     def _parse_plan(self, text: str) -> OperatorPlan | None:
         if not text:
@@ -85,7 +111,6 @@ class OperatorPlanningAgent:
                     valid = all(
                         isinstance(item, dict)
                         and "subtask" in item
-                        and "llm_backbone" in item
                         for item in parsed
                     )
                     if valid:
@@ -112,8 +137,8 @@ class OperatorPlanningAgent:
     @staticmethod
     def _fallback_plan() -> OperatorPlan:
         return OperatorPlan(operators=[
-            Operator(index=1, subtask="Explore and understand the codebase structure and identify relevant files", llm_backbone=LLMBackbone.A),
-            Operator(index=2, subtask="Analyze the task requirements and plan the implementation approach", llm_backbone=LLMBackbone.B),
-            Operator(index=3, subtask="Implement the required changes to solve the task", llm_backbone=LLMBackbone.C),
-            Operator(index=4, subtask="Verify the changes by running tests and checking the results", llm_backbone=LLMBackbone.A),
+            Operator(index=1, subtask="Explore and understand the codebase structure and identify relevant files"),
+            Operator(index=2, subtask="Analyze the task requirements and plan the implementation approach"),
+            Operator(index=3, subtask="Implement the required changes to solve the task"),
+            Operator(index=4, subtask="Verify the changes by running tests and checking the results"),
         ])

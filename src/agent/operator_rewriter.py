@@ -87,6 +87,7 @@ class RuleBasedRewriter:
         ce_map: dict[int, OperatorCEResult],
     ) -> list[RewriteAction]:
         actions = []
+        max_bb = LLMBackbone.max_backbone()
         for op in plan.operators:
             ce = ce_map.get(op.index)
             if ce is None or ce.error:
@@ -99,7 +100,7 @@ class RuleBasedRewriter:
                         target_indices=[op.index],
                         reason=f"Uncertainty {ce.uncertainty:.2f} >= {self.UPGRADE_UNCERTAINTY_THRESHOLD}, upgrading A→B",
                     ))
-                elif op.llm_backbone == LLMBackbone.B:
+                elif op.llm_backbone == LLMBackbone.B and max_bb == LLMBackbone.C:
                     op.llm_backbone = LLMBackbone.C
                     actions.append(RewriteAction(
                         action_type="upgrade",
@@ -115,6 +116,9 @@ class RuleBasedRewriter:
     ) -> list[RewriteAction]:
         actions = []
         ops_to_split: list[tuple[int, int]] = []
+
+        if LLMBackbone.C not in LLMBackbone.available_backbones():
+            return actions
 
         for op in plan.operators:
             ce = ce_map.get(op.index)
@@ -265,6 +269,7 @@ class RuleBasedRewriter:
 
 class LLMRewriter:
     def __init__(self, rewrite_cfg: dict):
+        self.rewrite_cfg = rewrite_cfg
         self.caller = SimpleAPICaller(
             llm_name=rewrite_cfg["llm_name"],
             api_key=rewrite_cfg["key"],
@@ -272,13 +277,23 @@ class LLMRewriter:
             api_version=rewrite_cfg.get("api_version"),
         )
 
+    def _get_llm_backbone(self) -> str:
+        llm_name = self.caller.llm_name.lower()
+        if "flash" in llm_name or "doubao_flash" in llm_name or "lite" in llm_name:
+            return "A"
+        if "kimi" in llm_name:
+            return "C"
+        return "B"
+
     def rewrite(
         self,
         instruction: str,
         plan: OperatorPlan,
         ce_results: list[OperatorCEResult],
         max_attempts: int = 2,
-    ) -> tuple[OperatorPlan, list[dict[str, Any]]]:
+    ) -> tuple[OperatorPlan, list[dict[str, Any]], dict[str, Any]]:
+        usage_before = self.caller.get_total_usage()
+
         total_cost = sum(r.estimated_cost for r in ce_results if not r.error)
         total_uncertainty = plan.total_uncertainty([r.to_dict() for r in ce_results])
 
@@ -306,7 +321,8 @@ class LLMRewriter:
                     new_plan, changes = result
                     new_plan.reindex()
                     logger.info(f"LLM rewrite produced {len(new_plan.operators)} operators with {len(changes)} changes")
-                    return new_plan, changes
+                    metrics = self._compute_metrics(usage_before)
+                    return new_plan, changes, metrics
             except Exception as e:
                 logger.error(f"LLM rewrite attempt {attempt} failed: {e}")
 
@@ -322,7 +338,20 @@ class LLMRewriter:
                 })
 
         logger.warning("LLM rewrite failed, returning original plan")
-        return plan, []
+        metrics = self._compute_metrics(usage_before)
+        return plan, [], metrics
+
+    def _compute_metrics(self, usage_before: dict) -> dict[str, Any]:
+        usage_after = self.caller.get_total_usage()
+        return {
+            "prompt_tokens": usage_after["input_tokens"] - usage_before["input_tokens"],
+            "completion_tokens": usage_after["output_tokens"] - usage_before["output_tokens"],
+            "cache_read_tokens": usage_after["cached_tokens"] - usage_before["cached_tokens"],
+            "reasoning_tokens": usage_after["reasoning_tokens"] - usage_before["reasoning_tokens"],
+            "total_tokens": usage_after["total_tokens"] - usage_before["total_tokens"],
+            "accumulated_cost": 0.0,
+            "llm_backbone": self._get_llm_backbone(),
+        }
 
     def _parse_rewrite_response(
         self, text: str
@@ -375,9 +404,10 @@ class OperatorRewriter:
         instruction: str,
         plan: OperatorPlan,
         ce_results: list[OperatorCEResult],
-    ) -> tuple[OperatorPlan, list[dict[str, Any]]]:
+    ) -> tuple[OperatorPlan, list[dict[str, Any]], dict[str, Any]]:
         all_actions: list[dict[str, Any]] = []
         current_plan = copy.deepcopy(plan)
+        llm_metrics: dict[str, Any] = {}
 
         if self.use_rule_based and self.rule_rewriter:
             current_plan, rule_actions = self.rule_rewriter.rewrite(current_plan, ce_results)
@@ -385,7 +415,7 @@ class OperatorRewriter:
                 all_actions.append(a.to_dict())
 
         if self.use_llm and self.llm_rewriter:
-            current_plan, llm_changes = self.llm_rewriter.rewrite(
+            current_plan, llm_changes, llm_metrics = self.llm_rewriter.rewrite(
                 instruction, current_plan, ce_results,
             )
             all_actions.extend(llm_changes)
@@ -396,4 +426,4 @@ class OperatorRewriter:
         else:
             logger.info("No rewrite actions applied, keeping original plan")
 
-        return current_plan, all_actions
+        return current_plan, all_actions, llm_metrics
