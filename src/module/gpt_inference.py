@@ -72,11 +72,30 @@ class SimpleAPICaller:
             **kwargs,
         )
 
-        # 解析 usage 信息（OpenAI / Azure OpenAI / 兼容实现通常都会返回）
+        self._update_usage(completion)
+
+        return completion.choices[0].message.content
+
+    def chat_with_tools(self, messages: list, tools: list[dict], **kwargs):
+        if "timeout" not in kwargs:
+            kwargs["timeout"] = 600
+
+        completion = self.client.chat.completions.create(
+            model=self.llm_name,
+            messages=messages,
+            tools=tools,
+            **kwargs,
+        )
+
+        self._update_usage(completion)
+
+        choice = completion.choices[0]
+        return choice.message
+
+    def _update_usage(self, completion) -> None:
         usage = getattr(completion, "usage", None)
         usage_dict: dict = {}
         if usage is not None:
-            # 兼容 pydantic 模型和普通 dict
             if hasattr(usage, "to_dict"):
                 usage_dict = usage.to_dict()
             elif isinstance(usage, dict):
@@ -86,7 +105,6 @@ class SimpleAPICaller:
 
         input_tokens = int(usage_dict.get("prompt_tokens", 0) or 0)
         output_tokens = int(usage_dict.get("completion_tokens", 0) or 0)
-        # 不同网关可能字段名不同，做一次宽松兼容
         cached_tokens = int(
             usage_dict.get("prompt_tokens_cached", 0)
             or usage_dict.get("cached_tokens", 0)
@@ -116,8 +134,6 @@ class SimpleAPICaller:
         self._total_usage["cached_tokens"] += cached_tokens
         self._total_usage["reasoning_tokens"] += reasoning_tokens
         self._total_usage["total_tokens"] += total_tokens
-
-        return completion.choices[0].message.content
 
     def get_last_usage(self) -> dict:
         """返回最近一次调用的 token 统计。

@@ -1,8 +1,8 @@
-llm_name: ep-20251031122327-xq2tz
+llm_name: ep-20260417090842-vslxx
 key: 02002c34-ca56-4797-a742-87fd6ec3981c
 openai_base_url: https://ark-cn-beijing.bytedance.net/api/v3
 
 price_dollar_per_token:
-  input_token: 0.0000000571
-  output_token: 0.0000001429
-  cached_token: 0.0000000229
+  input_token: 0.00000008
+  output_token: 0.0000008
+  cached_token: 0.00000003

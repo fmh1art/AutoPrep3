@@ -1,5 +1,5 @@
 """
-SWE-bench Runner — 基于 OpenHands SDK 的 SWE-bench 评估流程。
+SWE-bench Runner — 基于自定义 CodeAgent 的 SWE-bench 评估流程。
 
 流程：
   1. prepare_instances()   — 从数据集加载实例
@@ -14,7 +14,9 @@ import json
 import os
 import platform
 import sys
-import uuid, yaml, time
+import uuid
+import yaml
+import time
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from typing import Any, List
 
@@ -30,18 +32,12 @@ from src.benchmarks.utils.log_setup import build_log_formatter, configure_main_l
 from src.benchmarks.utils.dataset import get_dataset
 
 from src.agent.code_agent import CodeAgent, AgentResult
-from src.agent.code_agent_with_reflection import CodeAgentWithReflection
-from src.agent.code_agent_fcm_complete import CodeAgentWithFCM
 from src.agent.code_agent_plan_mode import CodeAgentPlanMode
 
-from openhands.sdk import LLM, get_logger
-from openhands.sdk.event import ActionEvent, ObservationEvent
-from openhands.sdk.llm import content_to_str
-from openhands.tools.preset.default import get_default_tools
 from openhands.workspace import DockerWorkspace
 from src.tools.funcs import render_j2
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class RepoPreparationError(RuntimeError):
@@ -254,17 +250,19 @@ def _collect_extra_metrics(metrics: dict[str, Any]) -> dict[str, dict[str, Any]]
 
 # ── 主类 ──────────────────────────────────────────────────────────────────────
 
+
 class SweBenchRunner:
     """
     使用 CodeAgent + SWE-bench 官方镜像进行代码修复评估。
 
     Args:
-        api_url:      LLM API 基础 URL（OpenAI 兼容）
-        model_name:   模型名称
-        api_key:      API 密钥
+        exp_cfg:      主模型配置字典
+        cheap_exp_cfg: 便宜模型配置字典
         tmp_root:     本地临时目录，存放日志、patch、eval 输出
         prompt_path:  Jinja2 提示词模板路径
-        use_reflection: 是否使用带反思机制的 Agent（默认 False）
+        use_plan_mode: 是否使用 Plan-Execution Agent（默认 False）
+        use_cost_estimation: 是否使用 Cost Estimation（默认 False）
+        num_candidate_plans: 候选计划数量
     """
 
     def __init__(
@@ -275,50 +273,19 @@ class SweBenchRunner:
         prompt_path: str = "./src/prompts/query.j2",
         http_proxy: str | None = None,
         no_proxy: str | None = None,
-        use_reflection: bool = False,
-        use_fcm: bool = False,
         use_plan_mode: bool = False,
         use_cost_estimation: bool = False,
         num_candidate_plans: int = 3,
     ):
-        exp_model_name = exp_cfg['llm_name']
-        exp_api_key = exp_cfg['key']
-        exp_api_url = exp_cfg['openai_base_url']
-        exp_api_version = exp_cfg.get('api_version')
-
-        cheap_model_name = cheap_exp_cfg['llm_name']
-        cheap_api_key = cheap_exp_cfg['key']
-        cheap_api_url = cheap_exp_cfg['openai_base_url']
-        cheap_api_version = cheap_exp_cfg.get('api_version')
-
-        exp_model_name = f"openai/{exp_model_name}"
-        cheap_model_name = f"openai/{cheap_model_name}"
-
-        self.exp_llm = LLM(
-            model=exp_model_name,
-            api_key=exp_api_key,
-            base_url=exp_api_url,
-            api_version=exp_api_version,
-        )
-        self.cheap_llm = LLM(
-            model=cheap_model_name,
-            api_key=cheap_api_key,
-            base_url=cheap_api_url,
-            api_version=cheap_api_version,
-        )
-
-        self.tools = get_default_tools(enable_browser=False)
+        self.exp_cfg = exp_cfg
+        self.cheap_exp_cfg = cheap_exp_cfg
         self.tmp_root = tmp_root
         self.prompt_path = prompt_path
         self.http_proxy = http_proxy
         self.no_proxy = no_proxy or "localhost,127.0.0.1::1"
-        self.use_reflection = use_reflection
-        self.use_fcm = use_fcm
         self.use_plan_mode = use_plan_mode
         self.use_cost_estimation = use_cost_estimation
         self.num_candidate_plans = num_candidate_plans
-        self.exp_cfg = exp_cfg
-        self.cheap_exp_cfg = cheap_exp_cfg
         self.main_log_path = configure_main_logger(self.tmp_root)
         self._setup_proxy_env()
 
@@ -372,9 +339,6 @@ class SweBenchRunner:
     ) -> DockerWorkspace:
         """
         为指定实例启动 DockerWorkspace。
-
-        使用 OpenHands 官方 agent-server 镜像作为运行环境，仓库将在
-        evaluate_instance() 中通过 git clone 克隆到容器内。
 
         Args:
             instance:            SWE-bench 实例 dict
@@ -466,27 +430,24 @@ class SweBenchRunner:
             with open(trajectory_path, "w", encoding="utf-8") as f:
                 f.write(f"# Trajectory: {instance_id}\n\n")
 
-            def save_trajectory(event):
+            def save_trajectory(record: dict):
                 try:
-                    event_type = event.__class__.__name__
                     with open(trajectory_path, "a", encoding="utf-8") as f:
-                        f.write(f"## {event_type}\n")
-                        if isinstance(event, ActionEvent):
-                            if getattr(event, "thought", None):
-                                thought = event.thought
-                                if isinstance(thought, list):
-                                    thought = "".join(getattr(t, "text", str(t)) for t in thought)
-                                f.write(f"**Thought**: {thought}\n\n")
-                            f.write(f"**Tool**: {event.tool_name}\n")
-                            args = getattr(getattr(event, "tool_call", None), "arguments", None)
+                        role = record.get("role", "")
+                        if role == "assistant":
+                            f.write(f"## Assistant\n")
+                            thinking = record.get("thinking", "")
+                            if thinking:
+                                f.write(f"**Thought**: {thinking}\n\n")
+                        elif role == "tool":
+                            f.write(f"## Tool\n")
+                            f.write(f"**Tool**: {record.get('tool_name', '')}\n")
+                            args = record.get("tool_args", {})
                             if args:
-                                f.write(f"**Args**: ```json\n{args}\n```\n\n")
-                        elif isinstance(event, ObservationEvent):
-                            obs = getattr(event, "observation", None)
-                            content = ""
-                            if obs is not None:
-                                content = "".join(content_to_str(obs.to_llm_content))
-                            f.write(f"**Observation**: ```\n{content}\n```\n\n")
+                                f.write(f"**Args**: ```json\n{json.dumps(args, indent=2)}\n```\n\n")
+                            obs = record.get("observation", "")
+                            if obs:
+                                f.write(f"**Observation**: ```\n{obs[:2000]}\n```\n\n")
                         f.write("---\n\n")
                 except Exception as ex:
                     logger.warning(f"Error saving trajectory: {ex}")
@@ -526,11 +487,14 @@ class SweBenchRunner:
             # ── 设置实例上下文 ─────────────────────────────────────────────────
             instance["repo_path"] = repo_path
 
-            task_description = render_j2(template_name=os.path.basename(self.prompt_path), context={
-                "repo_path": repo_path,
-                "problem_statement": str(instance.get('problem_statement', '')).strip(),
-                "base_commit": base_commit
-            })
+            task_description = render_j2(
+                template_name=os.path.basename(self.prompt_path),
+                context={
+                    "repo_path": repo_path,
+                    "problem_statement": str(instance.get('problem_statement', '')).strip(),
+                    "base_commit": base_commit
+                }
+            )
 
             # ── 使用 CodeAgent 运行对话 ───────────────────────────────────────
             if self.use_plan_mode:
@@ -543,10 +507,9 @@ class SweBenchRunner:
                 })
                 code_agent = CodeAgentPlanMode(
                     planner_cfg=self.cheap_exp_cfg,
-                    executor_llm=self.exp_llm,
+                    executor_llm=None,  # 使用自定义 CodeAgent，不需要 OpenHands LLM
                     ce_cfg=ce_cfg,
                     executor_price=executor_price,
-                    tools=self.tools,
                 )
                 agent_result = code_agent.run(
                     instruction=task_description,
@@ -562,32 +525,14 @@ class SweBenchRunner:
                     ),
                     num_candidate_plans=self.num_candidate_plans,
                 )
-            elif self.use_fcm:
-                logger.info(f"Using CodeAgentWithFCM for {instance_id}")
-                code_agent = CodeAgentWithFCM(code_llm=self.exp_llm, context_llm=self.cheap_llm, tools=self.tools)
-                agent_result = code_agent.run(
-                    instruction=task_description,
-                    workspace=workspace,
-                    callbacks=[save_trajectory],
-                    repo_path=repo_path,
-                    log_dir=log_dir,
-                )
-            elif self.use_reflection:
-                logger.info(f"Using CodeAgentWithReflection for {instance_id}")
-                code_agent = CodeAgentWithReflection(llm=self.exp_llm, reviewer_llm=self.cheap_llm, tools=self.tools)
-                agent_result = code_agent.run(
-                    instruction=task_description,
-                    workspace=workspace,
-                    callbacks=[save_trajectory],
-                    repo_path=repo_path,
-                )
             else:
                 logger.info(f"Using CodeAgent for {instance_id}")
-                code_agent = CodeAgent(llm=self.exp_llm, tools=self.tools)
+                code_agent = CodeAgent(llm_cfg=self.exp_cfg)
                 agent_result = code_agent.run(
                     instruction=task_description,
                     workspace=workspace,
                     callbacks=[save_trajectory],
+                    output_dir=log_dir,
                 )
 
             # ── 打印 metrics ──────────────────────────────────────────────────
@@ -668,7 +613,7 @@ if __name__ == "__main__":
         prompt_path="./src/prompts/query.j2",
         http_proxy=HTTP_PROXY,
         no_proxy=NO_PROXY_LIST,
-        use_fcm=True,
+        use_plan_mode=True,
     )
 
     all_instances = runner.prepare_instances(

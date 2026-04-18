@@ -3,6 +3,6 @@ key: 02002c34-ca56-4797-a742-87fd6ec3981c
 openai_base_url: https://ark-cn-beijing.bytedance.net/api/v3
 
 price_dollar_per_token:
-  input_token: 0.0000001143
-  output_token: 0.0000002857
-  cached_token: 0.0000000457
+  input_token: 0.00000053
+  output_token: 0.00000339
+  cached_token: 0.00000011

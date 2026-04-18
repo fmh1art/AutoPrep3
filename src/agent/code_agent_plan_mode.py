@@ -16,14 +16,15 @@ from typing import Any, Callable, Optional
 import time
 import json
 import re
+import logging
 
-from openhands.sdk import Agent, Conversation, LLM, get_logger
-from openhands.sdk.llm import content_to_str
-from openhands.sdk.event import ActionEvent, ObservationEvent
-from openhands.tools.preset.default import get_default_tools
 from openhands.workspace import DockerWorkspace
 from src.tools.funcs import render_j2
 from src.module.gpt_inference import SimpleAPICaller
+from src.agent.code_agent import CodeAgent, AgentResult
+
+logger = logging.getLogger(__name__)
+
 
 def render_planning_prompt(
     instruction: str,
@@ -39,16 +40,15 @@ def render_planning_prompt(
         ctx["num_candidate_plans"] = num_candidate_plans
     return render_j2("code_agent_plan_mode_planning.j2", ctx, base_dir=base_dir)
 
-def render_execution_prompt(instruction: str, repo_path: str, serialized_plan: str, base_dir: Optional[str] = None) -> str:
+
+def render_execution_prompt(
+    instruction: str, repo_path: str, serialized_plan: str, base_dir: Optional[str] = None
+) -> str:
     return render_j2(
         "code_agent_plan_mode_execution.j2",
         {"instruction": instruction, "repo_path": repo_path, "serialized_plan": serialized_plan},
         base_dir=base_dir,
     )
-
-from src.benchmarks.utils.fake_user_response import run_conversation_with_fake_user_response
-
-logger = get_logger(__name__)
 
 
 @dataclass
@@ -62,30 +62,22 @@ class ReactStepRecord:
     payload: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class AgentResult:
-    metrics: dict[str, Any] = field(default_factory=dict)
-    conversation: Conversation | None = None
-    execution_trajectory: list[ReactStepRecord] = field(default_factory=list)
-    execution_steps_metrics: list[dict[str, Any]] = field(default_factory=list)
-    other_content: dict[str, Any] = field(default_factory=dict)
-
 class CodeAgentPlanMode:
 
     def __init__(
         self,
         planner_cfg: dict | None = None,
-        executor_llm: LLM | None = None,
+        executor_llm: Any | None = None,
         ce_cfg: dict | None = None,
         executor_price: dict[str, float] | None = None,
         tools: list | None = None,
         system_prompt_kwargs: dict | None = None,
-        planner_llm: LLM | None = None,  # Backward compatibility
+        planner_llm: Any | None = None,  # Backward compatibility
     ):
         if planner_cfg is None and planner_llm is not None:
-            # Backward compatibility: old interface (planner_llm, executor_llm, tools)
+            # Backward compatibility: old interface
             self.planner_caller = SimpleAPICaller(
-                llm_name=planner_llm.model.replace("openai/", ""),
+                llm_name=getattr(planner_llm, "model", "").replace("openai/", ""),
                 api_key=getattr(planner_llm, "api_key", ""),
                 base_url=getattr(planner_llm, "base_url", None),
                 api_version=getattr(planner_llm, "api_version", None),
@@ -93,8 +85,8 @@ class CodeAgentPlanMode:
             self.executor_llm = executor_llm
             self.ce_cfg = None
             self.executor_price = {}
-            self.tools = tools if tools is not None else get_default_tools(enable_browser=False)
-            self.system_prompt_kwargs = system_prompt_kwargs or {"cli_mode": True}
+            self.tools = tools
+            self.system_prompt_kwargs = system_prompt_kwargs or {}
         else:
             # New interface
             self.planner_caller = SimpleAPICaller(
@@ -106,86 +98,27 @@ class CodeAgentPlanMode:
             self.executor_llm = executor_llm
             self.ce_cfg = ce_cfg
             self.executor_price = executor_price or {}
-            self.tools = tools if tools is not None else get_default_tools(enable_browser=False)
-            self.system_prompt_kwargs = system_prompt_kwargs or {"cli_mode": True}
+            self.tools = tools
+            self.system_prompt_kwargs = system_prompt_kwargs or {}
 
     # ----------------------------
     # Internal helpers (metrics)
     # ----------------------------
 
     @staticmethod
-    def _conversation_metrics(conversation: Conversation) -> dict[str, Any]:
-        """Read metrics from conversation_stats so remote conversations report usage."""
-        return conversation.conversation_stats.get_combined_metrics().get()
-
-    @staticmethod
     def _merge_metrics_dict(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
-        """Merge two metrics.get() dicts by summing token usages and costs.
-
-        - accumulated_cost: sum
-        - token_usages list: concatenate
-        - accumulated_token_usage: element-wise sum
-        - response_latencies/costs: concatenate
-        - context_window: keep max when summing accumulated_token_usage
-        """
-        def sum_usage(u1: dict | None, u2: dict | None) -> dict | None:
-            if not u1:
-                return u2
-            if not u2:
-                return u1
-            # 允许新增 answer_tokens（等同于 completion_tokens，用于与 reasoning_tokens 并列展示）
-            comp_sum = u1.get("completion_tokens", 0) + u2.get("completion_tokens", 0)
-            reas_sum = u1.get("reasoning_tokens", 0) + u2.get("reasoning_tokens", 0)
-            return {
-                "model": u1.get("model", ""),
-                "prompt_tokens": u1.get("prompt_tokens", 0) + u2.get("prompt_tokens", 0),
-                "completion_tokens": comp_sum,
-                "cache_read_tokens": u1.get("cache_read_tokens", 0) + u2.get("cache_read_tokens", 0),
-                "cache_write_tokens": u1.get("cache_write_tokens", 0) + u2.get("cache_write_tokens", 0),
-                "reasoning_tokens": reas_sum,
-                "answer_tokens": comp_sum,
-                "context_window": max(u1.get("context_window", 0), u2.get("context_window", 0)),
-                "per_turn_token": 0,
-                "response_id": "",
-            }
-
+        """Merge two metrics dicts by summing token usages and costs."""
         return {
-            "accumulated_cost": (a.get("accumulated_cost", 0.0) + b.get("accumulated_cost", 0.0)),
-            "max_budget_per_task": a.get("max_budget_per_task") or b.get("max_budget_per_task"),
-            "accumulated_token_usage": sum_usage(a.get("accumulated_token_usage"), b.get("accumulated_token_usage")),
-            "costs": list(a.get("costs", [])) + list(b.get("costs", [])),
-            "response_latencies": list(a.get("response_latencies", [])) + list(b.get("response_latencies", [])),
-            "token_usages": list(a.get("token_usages", [])) + list(b.get("token_usages", [])),
+            "prompt_tokens": a.get("prompt_tokens", 0) + b.get("prompt_tokens", 0),
+            "completion_tokens": a.get("completion_tokens", 0) + b.get("completion_tokens", 0),
+            "reasoning_tokens": a.get("reasoning_tokens", 0) + b.get("reasoning_tokens", 0),
+            "cache_read_tokens": a.get("cache_read_tokens", 0) + b.get("cache_read_tokens", 0),
+            "cache_write_tokens": a.get("cache_write_tokens", 0) + b.get("cache_write_tokens", 0),
+            "total_tokens": a.get("total_tokens", 0) + b.get("total_tokens", 0),
+            "accumulated_cost": a.get("accumulated_cost", 0.0) + b.get("accumulated_cost", 0.0),
+            "input_tokens": a.get("input_tokens", 0) + b.get("input_tokens", 0),
+            "output_tokens": a.get("output_tokens", 0) + b.get("output_tokens", 0),
         }
-
-    # ----------------------------
-    # Internal helpers (prompting)
-    # ----------------------------
-    # 提示渲染已抽取到 src/tools/funcs.py 中，其他模块可直接复用。
-
-    # ----------------------------
-    # Internal helpers (trajectory)
-    # ----------------------------
-
-    @staticmethod
-    def _event_preview(event: Any) -> str:
-        try:
-            return str(event)
-        except Exception:
-            return repr(event)
-
-    @staticmethod
-    def _build_trajectory_md(events: list[Any]) -> str:
-        """Build a simple markdown transcript of events for trajectory logging."""
-        lines: list[str] = ["# Trajectory", ""]
-        for idx, e in enumerate(events):
-            ts = getattr(e, "timestamp", "")
-            etype = e.__class__.__name__
-            lines.append(f"## Step {idx+1} — {etype} @ {ts}")
-            lines.append("")
-            lines.append(CodeAgentPlanMode._event_preview(e))
-            lines.append("")
-        return "\n".join(lines)
 
     # ----------------------------
     # Filesystem helpers
@@ -325,19 +258,21 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
 
         current_dir = None
         for e in entries:
-            entry_dir = os.path.dirname(e['path']) or "."
+            entry_dir = os.path.dirname(e["path"]) or "."
             if entry_dir != current_dir:
                 current_dir = entry_dir
                 skipped_count = skipped_dirs.get(current_dir, 0)
                 if skipped_count > 0:
                     if current_dir != ".":
-                        lines_out.append(f"  ... ({skipped_count} more files in {current_dir}/ omitted)")
+                        lines_out.append(
+                            f"  ... ({skipped_count} more files in {current_dir}/ omitted)"
+                        )
 
-            size_str = f"{e['size']}B" if e['size'] >= 0 else "?"
-            lines_str = str(e['lines']) if e['lines'] >= 0 else "-"
-            tokens_str = str(e['tokens']) if e['tokens'] >= 0 else "-"
-            type_str = "binary" if e['binary'] else "text"
-            path_display = e['path']
+            size_str = f"{e['size']}B" if e["size"] >= 0 else "?"
+            lines_str = str(e["lines"]) if e["lines"] >= 0 else "-"
+            tokens_str = str(e["tokens"]) if e["tokens"] >= 0 else "-"
+            type_str = "binary" if e["binary"] else "text"
+            path_display = e["path"]
             if len(path_display) > 58:
                 path_display = "..." + path_display[-55:]
             lines_out.append(
@@ -345,11 +280,15 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
             )
 
         for sd, cnt in skipped_dirs.items():
-            if cnt > 0 and sd not in {os.path.dirname(e['path']) or "." for e in entries}:
+            if cnt > 0 and sd not in {
+                os.path.dirname(e["path"]) or "." for e in entries
+            }:
                 lines_out.append(f"  ... ({cnt} more files in {sd}/ omitted)")
 
         if len(entries) >= max_files:
-            lines_out.append(f"\n(truncated at {max_files} files, {total_on_disk} total on disk)")
+            lines_out.append(
+                f"\n(truncated at {max_files} files, {total_on_disk} total on disk)"
+            )
 
         return "\n".join(lines_out)
 
@@ -362,7 +301,7 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
         if not text:
             return None
 
-        pattern = r'```json\s*(\[.*?\])\s*```'
+        pattern = r"```json\s*(\[.*?\])\s*```"
         matches = re.findall(pattern, text, re.DOTALL)
 
         for m in reversed(matches):
@@ -433,8 +372,12 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
         logs_dir = os.path.join(out_dir, "log")
         swe_dir = os.path.join(out_dir, "swe_eval_logs")
         self._ensure_dirs(logs_dir, swe_dir)
-        planner_traj = planner_trajectory_path or os.path.join(logs_dir, "planner_trajectory.md")
-        execution_traj = execution_trajectory_path or os.path.join(logs_dir, "execution_trajectory.md")
+        planner_traj = planner_trajectory_path or os.path.join(
+            logs_dir, "planner_trajectory.md"
+        )
+        execution_traj = execution_trajectory_path or os.path.join(
+            logs_dir, "execution_trajectory.md"
+        )
 
         # ----------------
         # Phase 0: Workspace Scan
@@ -465,29 +408,38 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                 f.write("# Planner Trajectory\n\n")
                 if planner_meta:
                     f.write("## Agent Params (Planner)\n\n")
-                    f.write("```json\n" + json.dumps(planner_meta, ensure_ascii=False, indent=2) + "\n```\n\n")
+                    f.write(
+                        "```json\n"
+                        + json.dumps(planner_meta, ensure_ascii=False, indent=2)
+                        + "\n```\n\n"
+                    )
                 f.write("## Prompt\n\n")
-                f.write("```\n" + planning_prompt + "\n```\n\n")
+                f.write("```\n" + planning_prompt + "```\n\n")
         except Exception as e:
             logger.warning(f"Failed to init planner trajectory file {planner_traj}: {e}")
 
         logger.info("Calling planner LLM via SimpleAPICaller...")
         max_plan_attempts = 3
         planner_messages = [{"role": "user", "content": planning_prompt}]
-        planner_response = None
         parsed_plans = None
         usage_before = self.planner_caller.get_total_usage()
 
         for attempt in range(1, max_plan_attempts + 1):
             raw_response = self.planner_caller.chat(planner_messages)
             planner_usage = self.planner_caller.get_last_usage()
-            logger.info(f"Planner attempt {attempt}: response {len(raw_response)} chars, usage: {planner_usage}")
+            logger.info(
+                f"Planner attempt {attempt}: response {len(raw_response)} chars, usage: {planner_usage}"
+            )
 
             try:
                 with open(planner_traj, "a", encoding="utf-8") as f:
                     f.write(f"## Attempt {attempt}\n\n")
                     f.write(raw_response + "\n\n")
-                    f.write("```json\n" + json.dumps(planner_usage, ensure_ascii=False, indent=2, default=str) + "\n```\n\n---\n\n")
+                    f.write(
+                        "```json\n"
+                        + json.dumps(planner_usage, ensure_ascii=False, indent=2, default=str)
+                        + "\n```\n\n---\n\n"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to append planner trajectory: {e}")
 
@@ -501,7 +453,6 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                 parsed_plans = [single] if single else None
 
             if parsed_plans is not None:
-                planner_response = raw_response
                 break
 
             if attempt < max_plan_attempts:
@@ -513,7 +464,9 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                 )
                 planner_messages.append({"role": "assistant", "content": raw_response})
                 planner_messages.append({"role": "user", "content": retry_msg})
-                logger.warning(f"Planner attempt {attempt} failed to produce valid JSON, retrying...")
+                logger.warning(
+                    f"Planner attempt {attempt} failed to produce valid JSON, retrying..."
+                )
 
         usage_after = self.planner_caller.get_total_usage()
         planner_metrics: dict[str, Any] = {
@@ -536,7 +489,9 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
             candidate_plans = parsed_plans
             if candidate_plans is None:
                 logger.warning("Failed to extract any plans after retries, using fallback")
-                candidate_plans = [["Analyze the task instruction and implement the required changes"]]
+                candidate_plans = [
+                    ["Analyze the task instruction and implement the required changes"]
+                ]
 
             logger.info(f"Extracted {len(candidate_plans)} candidate plans")
             self._write_json(os.path.join(logs_dir, "candidate_plans.json"), candidate_plans)
@@ -572,7 +527,9 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                         "ce_results": ce_results_data,
                         "ce_metrics": ce_output["metrics"],
                     }
-                    logger.info(f"Plan {plan_idx}: estimated_dollar_cost={estimated_cost}, uncertainty={estimated_uncertainty}")
+                    logger.info(
+                        f"Plan {plan_idx}: estimated_dollar_cost={estimated_cost}, uncertainty={estimated_uncertainty}"
+                    )
                 except Exception as e:
                     logger.error(f"Cost estimation failed for plan {plan_idx}: {e}")
                     result = {
@@ -596,17 +553,17 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
             if valid_costs:
                 costs = [pc["estimated_dollar_cost"] for pc in valid_costs]
                 min_cost = min(costs)
-                
+
                 for pc in valid_costs:
                     relative_cost = pc["estimated_dollar_cost"] / max(min_cost, 1e-9)
                     uncertainty = pc["estimated_uncertainty"]
-                    
+
                     cost_weight = float(os.getenv("CE_COST_WEIGHT", "0.7"))
                     uncertainty_weight = float(os.getenv("CE_UNCERTAINTY_WEIGHT", "0.3"))
-                    
+
                     cost_score = (relative_cost - 1.0) * cost_weight
                     uncertainty_score = uncertainty * uncertainty_weight
-                    
+
                     pc["score"] = cost_score + uncertainty_score
                     pc["relative_cost"] = relative_cost
                     logger.info(
@@ -616,7 +573,7 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                         f"uncertainty={uncertainty:.3f}, "
                         f"score={pc['score']:.3f}"
                     )
-                
+
                 best = min(valid_costs, key=lambda x: x["score"])
             else:
                 best = plan_costs[0]
@@ -639,10 +596,18 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                     if not merged_ce:
                         merged_ce = dict(m)
                     else:
-                        for k in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
-                                  "cache_read_tokens", "cache_write_tokens", "total_tokens"):
+                        for k in (
+                            "prompt_tokens",
+                            "completion_tokens",
+                            "reasoning_tokens",
+                            "cache_read_tokens",
+                            "cache_write_tokens",
+                            "total_tokens",
+                        ):
                             merged_ce[k] = merged_ce.get(k, 0) + m.get(k, 0)
-                        merged_ce["accumulated_cost"] = merged_ce.get("accumulated_cost", 0.0) + m.get("accumulated_cost", 0.0)
+                        merged_ce["accumulated_cost"] = merged_ce.get(
+                            "accumulated_cost", 0.0
+                        ) + m.get("accumulated_cost", 0.0)
             ce_metrics = merged_ce
 
         else:
@@ -658,198 +623,124 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
         logger.info(f"Plan extracted: {len(json_plan)} subtasks")
 
         # ----------------
-        # Phase 2: Execution
+        # Phase 2: Execution (使用自定义 CodeAgent)
         # ----------------
-        # 创建执行代理（使用传入工具与 system_prompt_kwargs）
-        executor_agent = Agent(
-            llm=self.executor_llm,
-            tools=self.tools,
-            system_prompt_kwargs=self.system_prompt_kwargs,
-        )
+        # 构建执行 agent 的 LLM 配置
+        # 优先使用 executor_llm 的配置，否则使用 planner 的配置
+        if self.executor_llm is not None:
+            executor_cfg = {
+                "llm_name": getattr(self.executor_llm, "model", "").replace("openai/", ""),
+                "key": getattr(self.executor_llm, "api_key", ""),
+                "openai_base_url": getattr(self.executor_llm, "base_url", None),
+                "api_version": getattr(self.executor_llm, "api_version", None),
+            }
+        else:
+            # 使用 planner 的配置
+            executor_cfg = {
+                "llm_name": self.planner_caller.llm_name,
+                "key": self.planner_caller.api_key,
+                "openai_base_url": self.planner_caller.base_url,
+                "api_version": self.planner_caller.api_version,
+            }
 
-        step_index = 0
-        response_id_to_step: dict[str, int] = {}
-        execution_steps: list[ReactStepRecord] = []
-        steps_json: list[dict[str, Any]] = []
+        executor_agent = CodeAgent(
+            llm_cfg=executor_cfg,
+            max_steps=100,
+            max_retries_per_call=3,
+        )
 
         execution_prompt = render_execution_prompt(
             instruction=instruction,
             repo_path=repo_path,
             serialized_plan=serialized_plan,
         )
+
+        # 初始化执行轨迹记录
+        execution_steps: list[ReactStepRecord] = []
+        steps_json: list[dict[str, Any]] = []
+
         try:
             with open(execution_traj, "w", encoding="utf-8") as f:
                 f.write("# Execution Trajectory\n\n")
                 if execution_meta:
                     f.write("## Agent Params (Execution)\n\n")
-                    f.write("```json\n" + json.dumps(execution_meta, ensure_ascii=False, indent=2) + "\n```\n\n")
+                    f.write(
+                        "```json\n"
+                        + json.dumps(execution_meta, ensure_ascii=False, indent=2)
+                        + "\n```\n\n"
+                    )
                 f.write("## Initial Prompt\n\n")
-                f.write("```\n" + execution_prompt + "\n```\n\n")
+                f.write("```\n" + execution_prompt + "```\n\n")
         except Exception as e:
             logger.warning(f"Failed to init execution trajectory file {execution_traj}: {e}")
 
-        def exec_callback(event):
+        # 自定义回调函数来记录执行轨迹
+        step_index = 0
+
+        def exec_callback(record: dict):
             nonlocal step_index
             timestamp = time.time()
-            role = getattr(event, "source", "environment")
-            content_preview = CodeAgentPlanMode._event_preview(event)
             rec = ReactStepRecord(
                 index=step_index,
-                role=str(role),
-                content_preview=content_preview[:500],
-                metrics={},
+                role=record.get("role", ""),
+                content_preview=record.get("observation", "")[:500],
+                metrics=record.get("usage", {}),
                 timestamp=timestamp,
-                event_type=event.__class__.__name__,
+                event_type=record.get("role", ""),
+                payload=record,
             )
-            # 记录 llm_response_id → step
-            llm_resp_id = getattr(event, "llm_response_id", None)
-            if llm_resp_id:
-                response_id_to_step[str(llm_resp_id)] = step_index
             execution_steps.append(rec)
 
-            # 逐步追加执行轨迹（模仿 SWE Runner）
+            # 持久化到 trajectory.md
             try:
-                event_type = event.__class__.__name__
-                step_payload: dict[str, Any] = {
-                    "index": step_index,
-                    "event_type": event_type,
-                    "timestamp": timestamp,
-                    "role": role,
-                }
-
-                # 为 ActionEvent 抽取 thought/action 与该响应对应的 token 使用情况
-                if isinstance(event, ActionEvent):
-                    # thought
-                    thought_text = ""
-                    thought = getattr(event, "thought", None)
-                    if thought:
-                        if isinstance(thought, list):
-                            try:
-                                thought_text = "".join(getattr(t, "text", str(t)) for t in thought)
-                            except Exception:
-                                thought_text = str(thought)
-                        else:
-                            thought_text = str(thought)
-
-                    # action/tool
-                    tool_name = getattr(event, "tool_name", "")
-                    raw_args = getattr(getattr(event, "tool_call", None), "arguments", None)
-                    parsed_args: Any = None
-                    if raw_args is not None:
-                        if isinstance(raw_args, (dict, list)):
-                            parsed_args = raw_args
-                        else:
-                            s = str(raw_args)
-                            try:
-                                parsed_args = json.loads(s)
-                            except Exception:
-                                parsed_args = s
-
-                    step_payload.update(
-                        {
-                            "thought": thought_text,
-                            "action": {
-                                "tool": tool_name,
-                                "args": parsed_args,
-                                "summary": getattr(event, "summary", None),
-                            },
-                            "llm_response_id": llm_resp_id,
-                        }
-                    )
-
-                    # 从执行 LLM 的 metrics 中抓取与该 response_id 匹配的 usage/latency
-                    step_metrics: dict[str, Any] = {}
-                    try:
-                        m = self.executor_llm.metrics.get()
-                        # token usage per call
-                        for u in m.get("token_usages", []) or []:
-                            if str(u.get("response_id", "")) == str(llm_resp_id):
-                                step_metrics.update(
-                                    {
-                                        "prompt_tokens": u.get("prompt_tokens", 0),
-                                        "completion_tokens": u.get("completion_tokens", 0),
-                                        "cache_read_tokens": u.get("cache_read_tokens", 0),
-                                        "cache_write_tokens": u.get("cache_write_tokens", 0),
-                                        "reasoning_tokens": u.get("reasoning_tokens", 0),
-                                        "context_window": u.get("context_window", 0),
-                                        "response_id": u.get("response_id", ""),
-                                    }
-                                )
-                                # 新增：answer_tokens 等同于 completion_tokens（模型对外可见回答），与 reasoning_tokens 分开记录
-                                try:
-                                    step_metrics["answer_tokens"] = int(step_metrics.get("completion_tokens", 0) or 0)
-                                except Exception:
-                                    step_metrics["answer_tokens"] = step_metrics.get("completion_tokens", 0)
-                                break
-                        # response latency per call
-                        for lat in m.get("response_latencies", []) or []:
-                            if str(lat.get("response_id", "")) == str(llm_resp_id):
-                                step_metrics["response_latency_sec"] = lat.get("latency", 0.0)
-                                break
-                    except Exception:
-                        pass
-
-                    rec.metrics = step_metrics
-                    step_payload["metrics"] = step_metrics
-
-                # 为 ObservationEvent 抽取 observation 输出
-                elif isinstance(event, ObservationEvent):
-                    obs = getattr(event, "observation", None)
-                    content = ""
-                    if obs is not None:
-                        try:
-                            content = "".join(content_to_str(obs.to_llm_content))
-                        except Exception:
-                            content = str(obs)
-                    step_payload["observation"] = content
-
-                # 持久化到 trajectory.md
                 with open(execution_traj, "a", encoding="utf-8") as f:
-                    f.write(f"## {event_type}\n")
-                    if isinstance(event, ActionEvent):
-                        thought = getattr(event, "thought", None)
-                        if thought:
-                            if isinstance(thought, list):
-                                text = "".join(getattr(t, "text", str(t)) for t in thought)
-                            else:
-                                text = str(thought)
-                            f.write(f"**Thought**: {text}\n\n")
-                        f.write(f"**Tool**: {getattr(event, 'tool_name', '')}\n")
-                        args = getattr(getattr(event, "tool_call", None), "arguments", None)
+                    role = record.get("role", "")
+                    if role == "assistant":
+                        f.write(f"## Step {step_index} - Assistant\n")
+                        thinking = record.get("thinking", "")
+                        if thinking:
+                            f.write(f"**Thought**: {thinking}\n\n")
+                    elif role == "tool":
+                        f.write(f"## Step {step_index} - Tool\n")
+                        f.write(f"**Tool**: {record.get('tool_name', '')}\n")
+                        args = record.get("tool_args", {})
                         if args:
-                            f.write(f"**Args**: ```json\n{args}\n```\n\n")
-                        # 写入当前 step 的 metrics（若有）
-                        if rec.metrics:
-                            try:
-                                f.write("**Metrics**: ```json\n" + json.dumps(rec.metrics, ensure_ascii=False, indent=2) + "\n```\n\n")
-                            except Exception:
-                                pass
-                    elif isinstance(event, ObservationEvent):
-                        obs = getattr(event, "observation", None)
-                        content = ""
-                        if obs is not None:
-                            content = "".join(content_to_str(obs.to_llm_content))
-                        f.write(f"**Observation**: ```\n{content}\n```\n\n")
+                            f.write(f"**Args**: ```json\n{json.dumps(args, indent=2)}\n```\n\n")
+                        obs = record.get("observation", "")
+                        if obs:
+                            f.write(f"**Observation**: ```\n{obs[:2000]}\n```\n\n")
+                        usage = record.get("usage", {})
+                        if usage:
+                            f.write(
+                                "**Metrics**: ```json\n"
+                                + json.dumps(usage, ensure_ascii=False, indent=2)
+                                + "\n```\n\n"
+                            )
                     f.write("---\n\n")
 
                 # 收集结构化步骤信息（JSON）
+                step_payload = {
+                    "index": step_index,
+                    "role": role,
+                    "timestamp": timestamp,
+                    **record,
+                }
                 steps_json.append(step_payload)
             except Exception as ex:
                 logger.warning(f"Error saving execution trajectory: {ex}")
 
             step_index += 1
 
-        exec_conv = Conversation(
-            agent=executor_agent,
+        # 运行执行 agent
+        exec_result = executor_agent.run(
+            instruction=execution_prompt,
             workspace=workspace,
-            callbacks=(callbacks or []) + [exec_callback],
+            callbacks=[exec_callback] + (callbacks or []),
+            output_dir=logs_dir,
         )
+        exec_metrics = exec_result.metrics
 
-        exec_conv.send_message(execution_prompt)
-        run_conversation_with_fake_user_response(exec_conv)
-        exec_metrics = self._conversation_metrics(exec_conv)
-
-        # 写出结构化的步骤日志（JSON）：初始 prompt + 每一步输出与该步 metrics
+        # 写出结构化的步骤日志（JSON）
         try:
             self._write_json(
                 os.path.join(logs_dir, "execution_steps.json"),
@@ -858,29 +749,6 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
         except Exception as e:
             logger.warning(f"Failed to write execution_steps.json: {e}")
 
-        # 将 token_usages 映射到步骤（通过 response_id）
-        per_step: list[dict[str, Any]] = []
-        for usage in exec_metrics.get("token_usages", []):
-            resp_id = usage.get("response_id") or ""
-            step_id = response_id_to_step.get(str(resp_id), None)
-            item = {
-                "response_id": resp_id,
-                "step_index": step_id,
-                "prompt_tokens": usage.get("prompt_tokens", 0),
-                "completion_tokens": usage.get("completion_tokens", 0),
-                "cache_read_tokens": usage.get("cache_read_tokens", 0),
-                "cache_write_tokens": usage.get("cache_write_tokens", 0),
-                "reasoning_tokens": usage.get("reasoning_tokens", 0),
-            }
-            # 新增：answer_tokens（等同 completion_tokens，用于区分与 reasoning_tokens 的合计关系）
-            try:
-                item["answer_tokens"] = int(item.get("completion_tokens", 0) or 0)
-            except Exception:
-                item["answer_tokens"] = item.get("completion_tokens", 0)
-            per_step.append(item)
-
-        # 采用逐步追加策略，不再生成覆盖式全量轨迹快照
-
         # ----------------
         # 汇总与产物输出
         # ----------------
@@ -888,7 +756,6 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
         token_report: dict[str, Any] = {
             "planner": planner_metrics,
             "execution": exec_metrics,
-            "execution_per_step": per_step,
             "total": total_metrics,
         }
         if ce_metrics:
@@ -897,18 +764,6 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
         self._write_json(os.path.join(logs_dir, "token_usage.json"), token_report)
 
         def _summarize_usage(m: dict[str, Any]) -> dict[str, int]:
-            u = (m.get("accumulated_token_usage") or {})
-            if u:
-                comp = int(u.get("completion_tokens", 0) or 0)
-                reas = int(u.get("reasoning_tokens", 0) or 0)
-                return {
-                    "prompt_tokens": int(u.get("prompt_tokens", 0) or 0),
-                    "completion_tokens": comp,
-                    "answer_tokens": comp,
-                    "cache_read_tokens": int(u.get("cache_read_tokens", 0) or 0),
-                    "cache_write_tokens": int(u.get("cache_write_tokens", 0) or 0),
-                    "reasoning_tokens": reas,
-                }
             return {
                 "prompt_tokens": int(m.get("prompt_tokens", 0) or 0),
                 "completion_tokens": int(m.get("completion_tokens", 0) or 0),
@@ -922,7 +777,6 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
             "planner_summary": _summarize_usage(planner_metrics),
             "execution_summary": _summarize_usage(exec_metrics),
             "total_summary": _summarize_usage(total_metrics),
-            "execution_per_step": per_step,
         }
         if ce_metrics:
             results_payload["cost_estimation_summary"] = _summarize_usage(ce_metrics)
@@ -949,11 +803,13 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                 f"- CostEstimation accumulated_cost: {ce_metrics.get('accumulated_cost', 0.0)}"
             )
             log_lines.append(f"- CostEstimation tokens: {_summarize_usage(ce_metrics)}")
-        log_lines.extend([
-            f"- Planner tokens: {_summarize_usage(planner_metrics)}",
-            f"- Executor tokens: {_summarize_usage(exec_metrics)}",
-            f"- Total tokens: {_summarize_usage(total_metrics)}",
-        ])
+        log_lines.extend(
+            [
+                f"- Planner tokens: {_summarize_usage(planner_metrics)}",
+                f"- Executor tokens: {_summarize_usage(exec_metrics)}",
+                f"- Total tokens: {_summarize_usage(total_metrics)}",
+            ]
+        )
         self._write_text(os.path.join(logs_dir, "log.md"), "\n".join(log_lines))
 
         all_metrics: dict[str, Any] = {
@@ -974,10 +830,11 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
 
         result = AgentResult(
             metrics=all_metrics,
-            conversation=exec_conv,
-            execution_trajectory=execution_steps,
-            execution_steps_metrics=per_step,
-            other_content=other,
+            conversation=None,
         )
+        # 添加额外属性以兼容旧接口
+        result.execution_trajectory = execution_steps
+        result.execution_steps_metrics = []
+        result.other_content = other
 
         return result

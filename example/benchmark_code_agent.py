@@ -10,11 +10,11 @@ from pathlib import Path
 import yaml
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-from openhands.sdk import get_logger
+import logging
 from src.benchmarks.swe_bench_runner import SweBenchRunner
 from src.benchmarks.utils.log_setup import configure_main_logger
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -76,8 +76,6 @@ def main():
     parser.add_argument("--selected-instances", type=str, default=None, help="选定实例文件")
     parser.add_argument("--exp-config", type=str, required=True, help="主模型配置文件")
     parser.add_argument("--cheap-config", type=str, required=True, help="便宜模型配置文件")
-    parser.add_argument("--use-fcm", action="store_true", help="使用FCM Agent")
-    parser.add_argument("--use-reflection", action="store_true", help="使用Reflection Agent")
     parser.add_argument("--use-plan-mode", action="store_true", help="使用Plan-Execution Agent")
     parser.add_argument("--use-cost-estimation", action="store_true", help="使用Cost Estimation优化plan选择")
     parser.add_argument("--num-candidate-plans", type=int, default=3, help="候选plan数量")
@@ -105,7 +103,7 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     main_log_path = configure_main_logger(args.output_dir)
 
-    logger.info(f"Output: {args.output_dir}, Parallel: {args.parallel}, FCM: {args.use_fcm}")
+    logger.info(f"Output: {args.output_dir}, Parallel: {args.parallel}, PlanMode: {args.use_plan_mode}")
     logger.info(f"Main log file: {main_log_path}")
 
     # 准备runner配置
@@ -116,8 +114,6 @@ def main():
         "prompt_path": args.prompt_path,
         "http_proxy": args.http_proxy,
         "no_proxy": args.no_proxy,
-        "use_reflection": args.use_reflection,
-        "use_fcm": args.use_fcm,
         "use_plan_mode": args.use_plan_mode,
         "use_cost_estimation": args.use_cost_estimation,
         "num_candidate_plans": args.num_candidate_plans,
@@ -196,16 +192,15 @@ python example/benchmark_code_agent.py \
   --parallel 16 \
   --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
   --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org" \
-  --use-plan-mode
-
+      
+      
 python example/benchmark_code_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
   --split test \
-  --eval-limit 16 \
+  --eval-limit 64 \
   --exp-config _config/doubao.yaml \
   --cheap-config _config/doubao.yaml \
-  --parallel 8 \
+  --parallel 16 \
   --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org" \
-  --use-plan-mode
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 """
