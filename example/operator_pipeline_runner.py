@@ -192,11 +192,12 @@ def main():
         "--trajectory-passing-mode",
         type=str,
         default="trajectory",
-        choices=["trajectory", "description"],
+        choices=["trajectory", "description", "finish_only"],
         help=(
             "How to pass context between operators: "
             "'trajectory' = pass raw accumulated messages as prefix; "
-            "'description' = pass only operator descriptions and finish messages as text"
+            "'description' = pass only operator descriptions and finish messages as text; "
+            "'finish_only' = pass only finish messages from previous operators as text"
         ),
     )
     parser.add_argument("--parallel", type=int, default=1, help="Parallel workers")
