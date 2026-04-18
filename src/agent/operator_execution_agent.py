@@ -31,7 +31,7 @@ class OperatorExecResult:
 
 
 class OperatorExecutionAgent:
-    TRAJECTORY_MODES = ("trajectory", "description")
+    TRAJECTORY_MODES = ("trajectory", "description", "finish_only")
 
     def __init__(
         self,
@@ -108,6 +108,13 @@ class OperatorExecutionAgent:
                     f"Result: {summary['finish_message']}"
                 )
             previous_observations = "\n\n".join(parts)
+        elif self.trajectory_passing_mode == "finish_only" and previous_operator_summaries:
+            parts = []
+            for summary in previous_operator_summaries:
+                parts.append(
+                    f"[Op {summary['index']}] {summary['finish_message']}"
+                )
+            previous_observations = "\n".join(parts)
 
         exec_prompt = render_j2(
             "operator_execution.j2",
@@ -138,6 +145,11 @@ class OperatorExecutionAgent:
         elif self.trajectory_passing_mode == "description" and previous_observations:
             logger.info(
                 f"  [description mode] Passing previous operator summaries "
+                f"({len(previous_observations)} chars)"
+            )
+        elif self.trajectory_passing_mode == "finish_only" and previous_observations:
+            logger.info(
+                f"  [finish_only mode] Passing previous operator finish messages "
                 f"({len(previous_observations)} chars)"
             )
 
@@ -245,7 +257,7 @@ class OperatorExecutionAgent:
                 elif i == 0:
                     accumulated_messages = []
 
-            if self.trajectory_passing_mode == "description":
+            if self.trajectory_passing_mode in ("description", "finish_only"):
                 previous_operator_summaries.append({
                     "index": operator.index,
                     "backbone_display": operator.llm_backbone.display_name,

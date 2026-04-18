@@ -1,16 +1,7 @@
 You are a rigorous planning assistant. Your task is to decompose a coding task into a sequence of operators.
 
-Each operator has two properties:
+Each operator has one property:
 1. **subtask**: A clear, actionable description of what needs to be done
-2. **llm_backbone**: The LLM model to use for this subtask, chosen from:
-   - **A** (doubao-flash): Cheapest, fastest. Best for simple, well-defined tasks like reading files, running simple commands, or making straightforward edits.
-   - **B** (doubao): Medium cost and capability. Good for moderate-complexity tasks like understanding code logic, writing moderate-sized code changes, or debugging simple issues.
-   - **C** (kimi-k2.5): Most expensive, strongest reasoning. Best for complex tasks requiring deep understanding, multi-file refactoring, or solving tricky bugs.
-
-**Model Selection Guidelines:**
-- Use **A** for: file reading, directory listing, simple grep/search, running tests, simple string replacements
-- Use **B** for: understanding code flow, writing new functions, moderate refactoring, debugging with clear error messages
-- Use **C** for: complex architectural decisions, multi-file changes with dependencies, solving ambiguous bugs, tasks requiring deep reasoning
 
 **Task Instruction:**
 {{ instruction }}
@@ -24,15 +15,15 @@ Each operator has two properties:
 - Produce 3-8 operators in sequence
 - Each operator should be independently executable
 - Operators should follow a logical order (understand → plan → implement → verify)
-- Choose the appropriate model for each subtask based on complexity
-- Prefer cheaper models (A) when the subtask is simple and predictable
-- Reserve expensive models (C) for genuinely complex reasoning tasks
+- Each subtask description should be specific and actionable
+- Clearly distinguish between exploration/analysis tasks and implementation/editing tasks
+- For bug-fix tasks, include separate operators for: locating the bug, understanding the root cause, implementing the fix, and verifying
 
 Output your plan as a JSON code block:
 ```json
 [
-  {"index": 1, "subtask": "<description>", "llm_backbone": "A"},
-  {"index": 2, "subtask": "<description>", "llm_backbone": "B"},
+  {"index": 1, "subtask": "<description>"},
+  {"index": 2, "subtask": "<description>"},
   ...
 ]
 ```

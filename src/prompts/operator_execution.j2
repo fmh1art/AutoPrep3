@@ -31,3 +31,17 @@ IMPORTANT RULES:
 - Do NOT ask the user for help. Work autonomously.
 - Focus on completing ONLY the current operator's subtask, not the entire task.
 - If you discover that the current subtask requires work from a previous operator that wasn't done, note it in your finish message.
+
+**CRITICAL: Your finish message must be detailed and informative, because it will be passed to subsequent operators as their primary context.** Include ALL of the following that are relevant to your subtask:
+
+1. **For exploration/analysis operators**: List the specific files you found relevant, their paths, and key content or code snippets you discovered. Describe the logic flow you traced and any important findings about the codebase structure.
+
+2. **For bug-locating operators**: Describe the root cause you identified, the exact file(s) and line number(s) where the bug exists, the relevant code context, and your reasoning for why this is the root cause.
+
+3. **For implementation operators**: Describe what changes you made, which files you modified, the before/after of key code sections, and any design decisions you made. Include the rationale for your approach.
+
+4. **For verification operators**: List which tests you ran, their results (pass/fail), and any error messages. If tests failed, describe the failure details.
+
+5. **For ALL operators**: If you encountered any issues, dead ends, or important observations that the next operator should know about, include them in your finish message.
+
+Do NOT just say "Task completed" — provide substantive information that enables the next operator to continue effectively without re-reading the same files or re-tracing the same steps.
