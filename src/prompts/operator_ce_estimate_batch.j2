@@ -1,0 +1,51 @@
+You are a rigorous cost estimation assistant for a multi-model operator plan.
+
+Consider a task with instruction as below:
+
+{{ instruction }}
+
+The Planner agent generated an operator plan to solve the task, the plan is as below:
+
+{{ operator_plan }}
+
+You need to estimate the cost and uncertainty for ALL operators listed below. For each operator, predict the metrics under BOTH the CHEAP model and the EXPENSIVE model.
+
+**Cognitive Type Annotations:**
+Each operator has a cognitive type that indicates the nature of the work:
+- `perception`: Extracting facts from code — search, locate, read files, run existing tests. These tasks are usually predictable and can be handled well by CHEAP models.
+- `reasoning`: Deriving conclusions from facts — root cause analysis, solution design, impact assessment. These tasks require deep thinking and are less predictable with CHEAP models.
+- `action`: Modifying code based on conclusions — edit, create, replace, implement. Reliability depends on task complexity and preceding reasoning quality.
+
+**Important considerations for model capability:**
+- CHEAP model: good at perception tasks (search, read, run tests). Struggles with reasoning and complex action tasks.
+- EXPENSIVE model: handles all cognitive types well. Most valuable for reasoning and complex action tasks.
+
+[MEMORY_PLACEHOLDER]
+
+Output your estimation as a JSON code block. For each operator, provide predictions for both models:
+```json
+{
+    "operators": [
+        {
+            "operator_index": 1,
+            "CHEAP": {
+                "taken_steps": <predicted steps with CHEAP model>,
+                "taken_tool_list": <predicted tools with CHEAP model>,
+                "output_token_list": <predicted output tokens per step with CHEAP>,
+                "observation_token_list": <predicted observation tokens per step with CHEAP>,
+                "uncertainty": <float 0.0-1.0 for CHEAP model. Consider: (1) how predictable are the steps? (2) is CHEAP model capable enough for this subtask? (3) how much trial-and-error might it need? Be realistic - CHEAP model often struggles with complex tasks>
+            },
+            "EXPENSIVE": {
+                "taken_steps": <predicted steps with EXPENSIVE model>,
+                "taken_tool_list": <predicted tools with EXPENSIVE model>,
+                "output_token_list": <predicted output tokens per step with EXPENSIVE>,
+                "observation_token_list": <predicted observation tokens per step with EXPENSIVE>,
+                "uncertainty": <float 0.0-1.0 for EXPENSIVE model. EXPENSIVE model is more capable, so uncertainty should generally be lower than CHEAP for the same task>
+            }
+        },
+        ...
+    ]
+}
+```
+
+Directly output the JSON without any explanation.

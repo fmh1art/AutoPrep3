@@ -13,7 +13,9 @@ if TYPE_CHECKING:
     from openhands.workspace import DockerWorkspace
     from src.agent.code_agent import AgentResult
 
-from src.agent.operator import Operator, OperatorPlan, OperatorCEResult, LLMBackbone
+import copy
+
+from src.agent.operator import Operator, OperatorPlan, OperatorCEResult, LLMBackbone, CognitiveType, set_backbone_display_names
 from src.agent.operator_planning_agent import OperatorPlanningAgent
 from src.agent.operator_ce_agent import OperatorCEAgent
 from src.agent.operator_rewriter import OperatorRewriter
@@ -52,7 +54,11 @@ class OperatorPipeline:
         ce_operator_timeout: int = 60,
         ce_max_attempts: int = 1,
         max_rewrite_rounds: int = 1,
-        trajectory_passing_mode: str = "trajectory",
+        trajectory_passing_mode: str = "hybrid",
+        fallback_upgrade: bool = True,
+        selective_max_retries: int = 2,
+        selective_fallback_rule: str = "last_half",
+        force_backbone: str | None = None,
     ):
         self.config_dir = config_dir
         self.use_ce = use_ce
@@ -63,9 +69,16 @@ class OperatorPipeline:
         self.ce_operator_timeout = ce_operator_timeout
         self.ce_max_attempts = ce_max_attempts
         self.max_rewrite_rounds = max_rewrite_rounds
+        self.fallback_upgrade = fallback_upgrade
+        self.force_backbone = force_backbone
 
         if llm_configs is None:
             llm_configs = self._load_llm_configs(config_dir)
+        else:
+            display_names = {}
+            for key, cfg in llm_configs.items():
+                display_names[key] = cfg.get("llm_name", key)
+            set_backbone_display_names(display_names)
         self.llm_configs = llm_configs
 
         self.planning_agent = OperatorPlanningAgent(planner_cfg=planner_cfg)
@@ -90,22 +103,28 @@ class OperatorPipeline:
             max_steps_per_operator=max_steps_per_operator,
             config_dir=config_dir,
             trajectory_passing_mode=trajectory_passing_mode,
+            fallback_upgrade=fallback_upgrade,
+            selective_max_retries=selective_max_retries,
+            selective_fallback_rule=selective_fallback_rule,
         )
 
     @staticmethod
     def _load_llm_configs(config_dir: str) -> dict[str, dict]:
         configs = {}
         mapping = {
-            "A": "doubao_flash.yaml",
-            "B": "doubao.yaml",
+            "CHEAP": "doubao.yaml",
+            "EXPENSIVE": "kimi2.5.yaml",
         }
+        display_names = {}
         for key, filename in mapping.items():
             path = os.path.join(config_dir, filename)
             if os.path.exists(path):
                 cfg = yaml.safe_load(open(path, "r"))
                 configs[key] = cfg
+                display_names[key] = cfg.get("llm_name", key)
             else:
                 logger.warning(f"Config file not found: {path}")
+        set_backbone_display_names(display_names)
         return configs
 
     @staticmethod
@@ -151,6 +170,8 @@ class OperatorPipeline:
         plan, planning_metrics = self.planning_agent.generate_plan(
             instruction=instruction,
             workspace_overview=workspace_overview,
+            workspace=workspace,
+            repo_path=repo_path,
         )
         self._write_json(os.path.join(logs_dir, "initial_plan.json"), plan.to_dict_list())
         logger.info(f"[OperatorPipeline] Initial plan: {len(plan.operators)} operators")
@@ -158,15 +179,44 @@ class OperatorPipeline:
             bb_str = f"[{op.llm_backbone.value}]" if op.llm_backbone else "[unassigned]"
             logger.info(f"  Op {op.index}: {bb_str} {op.subtask[:80]}")
 
-        # ---- Phase 2: Backbone Selection via CE ----
+        # ---- Phase 1.5: Information Closure Validation ----
+        plan = self._validate_information_closure(plan)
+        self._write_json(os.path.join(logs_dir, "plan_after_info_closure.json"), plan.to_dict_list())
+
+        # ---- Phase 1.6: Backbone Assignment by Cognitive Type ----
+        if self.force_backbone:
+            forced_bb = LLMBackbone.from_str(self.force_backbone)
+            logger.info(
+                f"[OperatorPipeline] Force backbone: overriding all operators to {forced_bb.value}"
+            )
+            for op in plan.operators:
+                op.llm_backbone = forced_bb
+        else:
+            for op in plan.operators:
+                if op.cognitive_type is not None:
+                    op.llm_backbone = op.cognitive_type.default_backbone
+                elif op.llm_backbone is None:
+                    op.llm_backbone = LLMBackbone.CHEAP
+            logger.info("[OperatorPipeline] Backbones assigned by cognitive type")
+            for op in plan.operators:
+                cog = op.cognitive_type.value if op.cognitive_type else "none"
+                logger.info(f"  Op {op.index}: [{cog}] → {op.llm_backbone.value} | {op.subtask[:60]}")
+
+        # ---- Phase 2+3: Iterative CE + Rewrite ----
         ce_results: list[OperatorCEResult] = []
         ce_metrics: dict[str, Any] = {}
         selection_details: dict[int, dict[str, Any]] = {}
-        if self.use_ce and self.backbone_selector:
-            logger.info("[OperatorPipeline] Phase 2: CE-based backbone selection...")
-            plan, selection_details, ce_results = self.backbone_selector.select(
+        rewrite_actions: list[dict[str, Any]] = []
+        rewrite_metrics: dict[str, Any] = {}
+        rewritten_plan = plan
+
+        if self.use_ce and self.ce_agent:
+            logger.info("[OperatorPipeline] Phase 2: CE-based cost & uncertainty estimation...")
+
+            ce_matrix, batch_metrics = self.ce_agent.estimate_plan_batch(
                 instruction=instruction,
-                plan=plan,
+                plan=rewritten_plan,
+                candidate_backbones=LLMBackbone.available_backbones(),
             )
 
             usage_after_ce = self.ce_agent.caller.get_total_usage()
@@ -180,83 +230,127 @@ class OperatorPipeline:
                 "llm_backbone": self.ce_agent._get_llm_backbone(),
             }
 
+            has_cognitive_types = any(op.cognitive_type is not None for op in rewritten_plan.operators)
+
+            if has_cognitive_types and self.backbone_selector and not self.force_backbone:
+                logger.info("[OperatorPipeline] Using cognitive-type-based backbone selection...")
+                rewritten_plan, selection_details, ce_results = self.backbone_selector.select_by_cognitive_type(
+                    instruction=instruction,
+                    plan=rewritten_plan,
+                )
+
+            for op in rewritten_plan.operators:
+                cheap_ce = ce_matrix.get(op.index, {}).get("CHEAP")
+                exp_ce = ce_matrix.get(op.index, {}).get("EXPENSIVE")
+                cheap_u = cheap_ce.uncertainty if cheap_ce and not cheap_ce.error else 0.5
+                exp_u = exp_ce.uncertainty if exp_ce and not exp_ce.error else 0.5
+                cheap_cost = cheap_ce.estimated_cost if cheap_ce and not cheap_ce.error else 0.0
+                exp_cost = exp_ce.estimated_cost if exp_ce and not exp_ce.error else 0.0
+                logger.info(
+                    f"  Op {op.index} [{op.llm_backbone.value}]: "
+                    f"CHEAP u={cheap_u:.2f} cost=${cheap_cost:.6f} | "
+                    f"EXPENSIVE u={exp_u:.2f} cost=${exp_cost:.6f}"
+                )
+
+            flat_ce = []
+            for op in rewritten_plan.operators:
+                ce_result = ce_matrix.get(op.index, {}).get(op.llm_backbone.value)
+                if ce_result:
+                    flat_ce.append(ce_result)
+            ce_results = flat_ce
+
             self._write_json(
                 os.path.join(logs_dir, "ce_results.json"),
                 [r.to_dict() for r in ce_results],
             )
-            self._write_json(
-                os.path.join(logs_dir, "backbone_selection.json"),
-                selection_details,
-            )
 
-            initial_plan_with_ce = []
-            for op in plan.operators:
-                op_dict = op.to_dict()
-                ce_for_op = next((r for r in ce_results if r.operator_index == op.index), None)
-                if ce_for_op and not ce_for_op.error:
-                    op_dict["ce_uncertainty"] = ce_for_op.uncertainty
-                    op_dict["ce_estimated_cost"] = ce_for_op.estimated_cost
-                    op_dict["ce_predicted_steps"] = ce_for_op.predicted_steps
-                if op.index in selection_details:
-                    op_dict["backbone_candidates"] = selection_details[op.index].get("candidates", {})
-                initial_plan_with_ce.append(op_dict)
-            self._write_json(
-                os.path.join(logs_dir, "initial_plan_with_ce.json"),
-                initial_plan_with_ce,
-            )
-            logger.info(f"[OperatorPipeline] Backbone selection complete:")
-            for op in plan.operators:
-                logger.info(f"  Op {op.index}: [{op.llm_backbone.value}] {op.subtask[:80]}")
-        elif not self.use_ce or not self.ce_agent:
-            for op in plan.operators:
-                if op.llm_backbone is None:
-                    op.llm_backbone = LLMBackbone.B
+            if self.use_rewrite and self.rewriter:
+                logger.info("[OperatorPipeline] Phase 3: Iterative rewrite...")
 
-        # ---- Phase 3: Rewriting ----
-        rewritten_plan = plan
-        rewrite_actions: list[dict[str, Any]] = []
-        rewrite_metrics: dict[str, Any] = {}
-        if self.use_rewrite and self.rewriter and ce_results:
-            logger.info("[OperatorPipeline] Phase 3: Rewriting plan...")
-            for round_idx in range(self.max_rewrite_rounds):
-                current_ce = ce_results if round_idx == 0 else new_ce_results
+                for round_idx in range(self.max_rewrite_rounds):
+                    logger.info(f"  Rewrite round {round_idx + 1}/{self.max_rewrite_rounds}")
 
-                rewritten_plan, rewrite_actions, rewrite_metrics = self.rewriter.rewrite(
-                    instruction=instruction,
-                    plan=rewritten_plan,
-                    ce_results=current_ce,
-                )
+                    current_ce_for_rewrite = []
+                    for op in rewritten_plan.operators:
+                        ce_result = ce_matrix.get(op.index, {}).get(op.llm_backbone.value)
+                        if ce_result:
+                            current_ce_for_rewrite.append(ce_result)
+                        else:
+                            current_ce_for_rewrite.append(OperatorCEResult(
+                                operator_index=op.index, uncertainty=0.5, error=True,
+                            ))
 
-                if not rewrite_actions:
-                    logger.info(f"[OperatorPipeline] No rewrite actions in round {round_idx + 1}, stopping")
-                    break
-
-                self._write_json(
-                    os.path.join(logs_dir, f"rewritten_plan_round_{round_idx + 1}.json"),
-                    rewritten_plan.to_dict_list(),
-                )
-                self._write_json(
-                    os.path.join(logs_dir, f"rewrite_actions_round_{round_idx + 1}.json"),
-                    rewrite_actions,
-                )
-
-                if self.use_ce and self.ce_agent and round_idx < self.max_rewrite_rounds - 1:
-                    logger.info(f"[OperatorPipeline] Re-estimating costs for rewritten plan (round {round_idx + 1})...")
-                    new_ce_results, new_ce_metrics = self.ce_agent.estimate_plan(
+                    rewritten_plan, round_actions, round_rewrite_metrics = self.rewriter.rewrite(
                         instruction=instruction,
                         plan=rewritten_plan,
-                        total_timeout=self.ce_total_timeout,
-                        operator_timeout=self.ce_operator_timeout,
-                        max_attempts=self.ce_max_attempts,
+                        ce_results=current_ce_for_rewrite,
+                        ce_matrix=ce_matrix,
                     )
-                    ce_metrics = new_ce_metrics
-                else:
-                    break
+                    rewrite_metrics = round_rewrite_metrics
+                    rewrite_actions.extend(round_actions)
+
+                    if not round_actions:
+                        logger.info(f"  No rewrite actions in round {round_idx + 1}, stopping")
+                        break
+
+                    self._write_json(
+                        os.path.join(logs_dir, f"rewritten_plan_round_{round_idx + 1}.json"),
+                        rewritten_plan.to_dict_list(),
+                    )
+                    self._write_json(
+                        os.path.join(logs_dir, f"rewrite_actions_round_{round_idx + 1}.json"),
+                        round_actions,
+                    )
+
+                    if round_idx < self.max_rewrite_rounds - 1:
+                        logger.info(f"  Re-estimating costs for rewritten plan (round {round_idx + 1})...")
+                        try:
+                            ce_matrix, _ = self.ce_agent.estimate_plan_batch(
+                                instruction=instruction,
+                                plan=rewritten_plan,
+                                candidate_backbones=LLMBackbone.available_backbones(),
+                            )
+                            usage_after_ce = self.ce_agent.caller.get_total_usage()
+                            ce_metrics = {
+                                "prompt_tokens": usage_after_ce.get("input_tokens", 0),
+                                "completion_tokens": usage_after_ce.get("output_tokens", 0),
+                                "cache_read_tokens": usage_after_ce.get("cached_tokens", 0),
+                                "reasoning_tokens": usage_after_ce.get("reasoning_tokens", 0),
+                                "total_tokens": usage_after_ce.get("total_tokens", 0),
+                                "accumulated_cost": 0.0,
+                                "llm_backbone": self.ce_agent._get_llm_backbone(),
+                            }
+                        except Exception as e:
+                            logger.warning(f"  Re-CE failed: {e}, stopping iteration")
+                            break
+
+                    logger.info(f"  Plan after round {round_idx + 1}: {len(rewritten_plan.operators)} operators")
+                    for op in rewritten_plan.operators:
+                        bb_str = op.llm_backbone.value if op.llm_backbone else "unassigned"
+                        logger.info(f"    Op {op.index}: [{bb_str}] {op.subtask[:80]}")
+
+            else:
+                for op in rewritten_plan.operators:
+                    cheap_ce = ce_matrix.get(op.index, {}).get("CHEAP")
+                    if cheap_ce and not cheap_ce.error and cheap_ce.uncertainty >= 0.35:
+                        exp_ce = ce_matrix.get(op.index, {}).get("EXPENSIVE")
+                        if exp_ce and not exp_ce.error and exp_ce.uncertainty < cheap_ce.uncertainty:
+                            op.llm_backbone = LLMBackbone.EXPENSIVE
+                            logger.info(
+                                f"  Op {op.index}: upgrading CHEAP→EXPENSIVE "
+                                f"(cheap_u={cheap_ce.uncertainty:.2f} → exp_u={exp_ce.uncertainty:.2f})"
+                            )
+
+        elif not self.use_ce or not self.ce_agent:
+            for op in rewritten_plan.operators:
+                if op.llm_backbone is None:
+                    op.llm_backbone = LLMBackbone.CHEAP
 
         self._write_json(os.path.join(logs_dir, "final_plan.json"), rewritten_plan.to_dict_list())
         logger.info(f"[OperatorPipeline] Final plan: {len(rewritten_plan.operators)} operators")
         for op in rewritten_plan.operators:
-            logger.info(f"  Op {op.index}: [{op.llm_backbone.value}] {op.subtask[:80]}")
+            bb_str = op.llm_backbone.value if op.llm_backbone else "unassigned"
+            logger.info(f"  Op {op.index}: [{bb_str}] {op.subtask[:80]}")
 
         # ---- Phase 4: Execution ----
         logger.info("[OperatorPipeline] Phase 4: Executing operator plan...")
@@ -355,7 +449,8 @@ class OperatorPipeline:
             "## Final Plan",
         ]
         for op in rewritten_plan.operators:
-            log_lines.append(f"- Op {op.index}: [{op.llm_backbone.value}] {op.subtask}")
+            bb_str = op.llm_backbone.value if op.llm_backbone else "unassigned"
+            log_lines.append(f"- Op {op.index}: [{bb_str}] {op.subtask}")
         log_lines.extend([
             "",
             "## Execution Summary",
@@ -385,6 +480,47 @@ class OperatorPipeline:
             rewrite_actions=rewrite_actions,
             other_content=other,
         )
+
+    @staticmethod
+    def _validate_information_closure(plan: OperatorPlan) -> OperatorPlan:
+        available_info: set[str] = set()
+        fixed_plan = copy.deepcopy(plan)
+        insertions: list[tuple[int, Operator]] = []
+
+        for i, op in enumerate(fixed_plan.operators):
+            if not op.requires_info:
+                available_info.update(op.produces_info)
+                continue
+
+            missing = [info for info in op.requires_info if info not in available_info]
+
+            if missing and op.cognitive_type != CognitiveType.PERCEPTION:
+                patch_op = Operator(
+                    index=0,
+                    subtask=f"Gather required information: {'; '.join(missing)}",
+                    cognitive_type=CognitiveType.PERCEPTION,
+                    requires_info=[],
+                    produces_info=missing,
+                )
+                insertions.append((i, patch_op))
+                logger.info(
+                    f"  [info-closure] Op {op.index} missing: {missing}, inserting perception op"
+                )
+                available_info.update(missing)
+
+            available_info.update(op.produces_info)
+
+        for pos, new_op in reversed(insertions):
+            fixed_plan.operators.insert(pos, new_op)
+
+        if insertions:
+            fixed_plan.reindex()
+            logger.info(
+                f"[OperatorPipeline] Info closure: inserted {len(insertions)} perception operators, "
+                f"total now {len(fixed_plan.operators)}"
+            )
+
+        return fixed_plan
 
     @staticmethod
     def _write_text(path: str, content: str) -> None:

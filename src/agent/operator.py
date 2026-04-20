@@ -6,52 +6,98 @@ from enum import Enum
 from typing import Any, List
 
 
+class CognitiveType(str, Enum):
+    PERCEPTION = "perception"
+    REASONING = "reasoning"
+    ACTION = "action"
+
+    @property
+    def default_backbone(self) -> "LLMBackbone":
+        _mapping = {
+            "perception": "CHEAP",
+            "reasoning": "EXPENSIVE",
+            "action": "EXPENSIVE",
+        }
+        return LLMBackbone(_mapping[self.value])
+
+    @staticmethod
+    def from_str(s: str) -> "CognitiveType":
+        _mapping = {
+            "perception": CognitiveType.PERCEPTION,
+            "reasoning": CognitiveType.REASONING,
+            "action": CognitiveType.ACTION,
+            "explore": CognitiveType.PERCEPTION,
+            "implement": CognitiveType.ACTION,
+            "verify": CognitiveType.PERCEPTION,
+        }
+        return _mapping.get(s.lower(), CognitiveType.PERCEPTION)
+
+    @staticmethod
+    def infer_from_subtask(subtask: str) -> "CognitiveType":
+        s = subtask.lower()
+        action_kws = [
+            "implement", "fix", "edit", "modify", "write", "create",
+            "add", "remove", "update", "replace", "refactor", "patch", "apply",
+        ]
+        reasoning_kws = [
+            "analyze", "reason", "root cause", "design", "plan",
+            "determine", "diagnose", "understand why", "figure out",
+        ]
+        if any(kw in s for kw in action_kws):
+            return CognitiveType.ACTION
+        if any(kw in s for kw in reasoning_kws):
+            return CognitiveType.REASONING
+        return CognitiveType.PERCEPTION
+
+
 class LLMBackbone(str, Enum):
-    A = "A"
-    B = "B"
-    C = "C"
-
-    @property
-    def display_name(self) -> str:
-        names = {"A": "doubao-flash", "B": "doubao", "C": "kimi-k2.5"}
-        return names[self.value]
-
-    @property
-    def config_filename(self) -> str:
-        filenames = {"A": "doubao_flash.yaml", "B": "doubao.yaml", "C": "kimi2.5.yaml"}
-        return filenames[self.value]
+    CHEAP = "CHEAP"
+    EXPENSIVE = "EXPENSIVE"
 
     @property
     def price_tier(self) -> int:
-        tiers = {"A": 1, "B": 2, "C": 3}
+        tiers = {"CHEAP": 1, "EXPENSIVE": 2}
         return tiers[self.value]
 
-    @staticmethod
-    def from_display_name(name: str) -> "LLMBackbone":
-        mapping = {
-            "doubao-flash": LLMBackbone.A,
-            "doubao_flash": LLMBackbone.A,
-            "doubao": LLMBackbone.B,
-            "kimi-k2.5": LLMBackbone.C,
-            "kimi2.5": LLMBackbone.C,
-            "kimi-k2.5": LLMBackbone.C,
-        }
-        return mapping.get(name.lower().replace(" ", "-"), LLMBackbone.B)
+    @property
+    def display_name(self) -> str:
+        return _BACKBONE_DISPLAY_NAMES.get(self.value, self.value)
 
     @staticmethod
     def available_backbones() -> list["LLMBackbone"]:
-        return [LLMBackbone.A, LLMBackbone.B]
+        return [LLMBackbone.CHEAP, LLMBackbone.EXPENSIVE]
 
     @staticmethod
     def max_backbone() -> "LLMBackbone":
-        available = LLMBackbone.available_backbones()
-        return max(available, key=lambda b: b.price_tier)
+        return LLMBackbone.EXPENSIVE
+
+    @staticmethod
+    def from_str(s: str) -> "LLMBackbone":
+        mapping = {
+            "CHEAP": LLMBackbone.CHEAP,
+            "EXPENSIVE": LLMBackbone.EXPENSIVE,
+            "A": LLMBackbone.CHEAP,
+            "B": LLMBackbone.CHEAP,
+            "C": LLMBackbone.EXPENSIVE,
+        }
+        return mapping.get(s.upper(), LLMBackbone.CHEAP)
+
+
+_BACKBONE_DISPLAY_NAMES: dict[str, str] = {}
+
+
+def set_backbone_display_names(names: dict[str, str]):
+    global _BACKBONE_DISPLAY_NAMES
+    _BACKBONE_DISPLAY_NAMES = names
 
 
 @dataclass
 class Operator:
     index: int
     subtask: str
+    cognitive_type: CognitiveType | None = None
+    requires_info: list[str] = field(default_factory=list)
+    produces_info: list[str] = field(default_factory=list)
     llm_backbone: LLMBackbone | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -59,6 +105,12 @@ class Operator:
             "index": self.index,
             "subtask": self.subtask,
         }
+        if self.cognitive_type is not None:
+            d["cognitive_type"] = self.cognitive_type.value
+        if self.requires_info:
+            d["requires_info"] = self.requires_info
+        if self.produces_info:
+            d["produces_info"] = self.produces_info
         if self.llm_backbone is not None:
             d["llm_backbone"] = self.llm_backbone.value
         return d
@@ -68,22 +120,31 @@ class Operator:
         backbone = d.get("llm_backbone")
         if backbone is None:
             backbone = None
-        elif isinstance(backbone, str) and backbone in ("A", "B", "C"):
-            backbone = LLMBackbone(backbone)
         elif isinstance(backbone, str):
-            backbone = LLMBackbone.from_display_name(backbone)
+            backbone = LLMBackbone.from_str(backbone)
         else:
             backbone = LLMBackbone(backbone)
+
+        cog_type = d.get("cognitive_type")
+        if cog_type is not None:
+            if isinstance(cog_type, str):
+                cog_type = CognitiveType.from_str(cog_type)
+        else:
+            cog_type = CognitiveType.infer_from_subtask(d.get("subtask", ""))
+
         return Operator(
             index=d["index"],
             subtask=d["subtask"],
+            cognitive_type=cog_type,
+            requires_info=d.get("requires_info", []),
+            produces_info=d.get("produces_info", []),
             llm_backbone=backbone,
         )
 
     def serialize_for_prompt(self) -> str:
-        if self.llm_backbone is not None:
-            return f"[Op {self.index}] (Model {self.llm_backbone.value}={self.llm_backbone.display_name}) {self.subtask}"
-        return f"[Op {self.index}] {self.subtask}"
+        cog = f" [{self.cognitive_type.value}]" if self.cognitive_type else ""
+        bb = f" ({self.llm_backbone.value})" if self.llm_backbone else ""
+        return f"[Op {self.index}]{cog}{bb} {self.subtask}"
 
 
 @dataclass
@@ -105,11 +166,7 @@ class OperatorPlan:
         for op in self.operators:
             lines.append(op.serialize_for_prompt())
         lines.append("")
-        available = LLMBackbone.available_backbones()
-        if LLMBackbone.C in available:
-            lines.append("Model Legend: A=doubao-flash (cheapest), B=doubao (medium), C=kimi-k2.5 (strongest)")
-        else:
-            lines.append("Model Legend: A=doubao-flash (cheapest), B=doubao (strongest)")
+        lines.append("Model Legend: CHEAP=cost-effective model, EXPENSIVE=stronger model")
         return "\n".join(lines)
 
     def serialize_for_execution(self) -> str:
@@ -117,12 +174,9 @@ class OperatorPlan:
             return "(empty plan)"
         lines = [f"### Operator Execution Plan ({len(self.operators)} operators)", ""]
         for op in self.operators:
-            if op.llm_backbone is not None:
-                lines.append(
-                    f"{op.index}. [Using {op.llm_backbone.display_name}] {op.subtask}"
-                )
-            else:
-                lines.append(f"{op.index}. {op.subtask}")
+            cog = f"[{op.cognitive_type.value}]" if op.cognitive_type else ""
+            bb = f"[{op.llm_backbone.value}]" if op.llm_backbone else ""
+            lines.append(f"{op.index}. {cog}{bb} {op.subtask}")
         return "\n".join(lines)
 
     def reindex(self) -> "OperatorPlan":

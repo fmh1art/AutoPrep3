@@ -40,12 +40,12 @@ class OperatorCEAgent:
     def _init_memorizers(self):
         memorizer_cfg_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
-            "_config", "doubao.yaml"
+            "_config", "kimi2.5.yaml"
         )
         try:
             memorizer_cfg = yaml.safe_load(open(memorizer_cfg_path, "r"))
         except Exception:
-            memorizer_cfg = self.llm_configs.get("B", {})
+            memorizer_cfg = self.llm_configs.get("EXPENSIVE", {})
 
         for backbone in LLMBackbone.available_backbones():
             mem_dir = os.path.join(self.memory_root, f"backbone_{backbone.value}")
@@ -55,7 +55,7 @@ class OperatorCEAgent:
             )
 
     def _get_memorizer(self, backbone: LLMBackbone) -> CEMemorizer:
-        return self.memorizers.get(backbone.value, self.memorizers[LLMBackbone.B.value])
+        return self.memorizers.get(backbone.value, self.memorizers[LLMBackbone.CHEAP.value])
 
     def _get_price(self, backbone: LLMBackbone) -> dict[str, float]:
         config = self.llm_configs.get(backbone.value, {})
@@ -130,6 +130,7 @@ class OperatorCEAgent:
                             price.get("cached_token", 0.0),
                         )
 
+
                     uncertainty = float(parsed.get("uncertainty", 0.5))
                     uncertainty = max(0.0, min(1.0, uncertainty))
 
@@ -185,13 +186,163 @@ class OperatorCEAgent:
         assert ce_result is not None
         return ce_result
 
+    def estimate_plan_batch(
+        self,
+        instruction: str,
+        plan: OperatorPlan,
+        candidate_backbones: list[LLMBackbone] | None = None,
+        timeout: int = 120,
+        max_attempts: int = 2,
+    ) -> tuple[dict[int, dict[str, OperatorCEResult]], dict[str, Any]]:
+        if candidate_backbones is None:
+            candidate_backbones = LLMBackbone.available_backbones()
+
+        usage_before = self.caller.get_total_usage()
+
+        plan_str = plan.serialize_for_prompt()
+        operators_info = []
+        for op in plan.operators:
+            operators_info.append({
+                "index": op.index,
+                "subtask": op.subtask,
+            })
+
+        ce_prompt = render_j2(
+            "operator_ce_estimate_batch.j2",
+            context={
+                "instruction": instruction,
+                "operator_plan": plan_str,
+                "operators": operators_info,
+            },
+        )
+
+        memory_sections = []
+        for bb in candidate_backbones:
+            memorizer = self._get_memorizer(bb)
+            memory_str = memorizer.serialize_memory(max_entries=10)
+            if memory_str and memory_str != "No memory entries available.":
+                memory_sections.append(
+                    f"### Memory for Model {bb.value} ({bb.display_name})\n\n{memory_str}"
+                )
+
+        if memory_sections:
+            combined_memory = "\n\n---\n\n".join(memory_sections)
+            ce_prompt = ce_prompt.replace(
+                "[MEMORY_PLACEHOLDER]",
+                f"Here is the relevant memory from previous executions with each model that may help your estimation:\n\n{combined_memory}",
+            )
+        else:
+            ce_prompt = ce_prompt.replace("[MEMORY_PLACEHOLDER]\n\n", "")
+
+        logger.info(f"CE batch estimation for {len(plan.operators)} operators")
+
+        messages: list[dict[str, str]] = [{"role": "user", "content": ce_prompt}]
+        ce_matrix: dict[int, dict[str, OperatorCEResult]] = {}
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                raw_response = self.caller.chat(messages, timeout=timeout)
+                parsed_text = parse_any_string(raw_response, code_type="json")
+                parsed = json.loads(parsed_text)
+
+                operators_data = parsed.get("operators", [])
+                if not operators_data:
+                    raise ValueError("No operators in batch response")
+
+                for op_data in operators_data:
+                    op_index = op_data.get("operator_index")
+                    if op_index is None:
+                        continue
+
+                    ce_matrix[op_index] = {}
+                    for bb in candidate_backbones:
+                        bb_data = op_data.get(bb.value, {})
+                        if not bb_data:
+                            ce_matrix[op_index][bb.value] = OperatorCEResult(
+                                operator_index=op_index, error=True
+                            )
+                            continue
+
+                        price = self._get_price(bb)
+                        out_tokens = bb_data.get("output_token_list", [])
+                        obs_tokens = bb_data.get("observation_token_list", [])
+                        estimated_cost = 0.0
+
+                        if out_tokens and obs_tokens:
+                            n_steps = min(len(out_tokens), len(obs_tokens))
+                            token_lis = [
+                                {
+                                    "output_token": int(out_tokens[i] or 0),
+                                    "observation_token": int(obs_tokens[i] or 0),
+                                }
+                                for i in range(n_steps)
+                            ]
+                            estimated_cost = calculate_multi_step_cost_without_prefix(
+                                token_lis,
+                                price.get("input_token", 0.0),
+                                price.get("output_token", 0.0),
+                                price.get("cached_token", 0.0),
+                            )
+
+                        uncertainty = float(bb_data.get("uncertainty", 0.5))
+                        uncertainty = max(0.0, min(1.0, uncertainty))
+
+                        ce_matrix[op_index][bb.value] = OperatorCEResult(
+                            operator_index=op_index,
+                            estimated_cost=estimated_cost,
+                            uncertainty=uncertainty,
+                            predicted_steps=bb_data.get("taken_steps", 1),
+                            predicted_tool_list=bb_data.get("taken_tool_list", []),
+                            output_token_list=[int(t or 0) for t in out_tokens],
+                            observation_token_list=[int(t or 0) for t in obs_tokens],
+                            error=False,
+                        )
+                        logger.info(
+                            f"  Op {op_index} [{bb.value}]: "
+                            f"cost={estimated_cost:.6f}, uncertainty={uncertainty:.2f}"
+                        )
+
+                if ce_matrix:
+                    break
+
+            except (json.JSONDecodeError, TypeError, ValueError) as e:
+                logger.error(f"CE batch parse failed (attempt {attempt}): {e}")
+                if attempt < max_attempts:
+                    messages.append({"role": "assistant", "content": raw_response if 'raw_response' in dir() else ""})
+                    messages.append({
+                        "role": "user",
+                        "content": "Your previous response could not be parsed. Please output the estimation as a valid JSON code block.",
+                    })
+
+        for op in plan.operators:
+            if op.index not in ce_matrix:
+                ce_matrix[op.index] = {}
+                for bb in candidate_backbones:
+                    ce_matrix[op.index][bb.value] = OperatorCEResult(
+                        operator_index=op.index, error=True
+                    )
+
+        usage_after = self.caller.get_total_usage()
+        metrics = {
+            "prompt_tokens": usage_after["input_tokens"] - usage_before["input_tokens"],
+            "completion_tokens": usage_after["output_tokens"] - usage_before["output_tokens"],
+            "cache_read_tokens": usage_after["cached_tokens"] - usage_before["cached_tokens"],
+            "reasoning_tokens": usage_after["reasoning_tokens"] - usage_before["reasoning_tokens"],
+            "total_tokens": usage_after["total_tokens"] - usage_before["total_tokens"],
+            "accumulated_cost": 0.0,
+            "llm_backbone": self._get_llm_backbone(),
+        }
+
+        return ce_matrix, metrics
+
     def _get_llm_backbone(self) -> str:
-        llm_name = self.caller.llm_name.lower()
-        if "flash" in llm_name or "doubao_flash" in llm_name or "lite" in llm_name:
-            return "A"
-        if "kimi" in llm_name:
-            return "C"
-        return "B"
+        my_llm_name = self.caller.llm_name
+        for backbone_key, cfg in self.llm_configs.items():
+            if cfg.get("llm_name") == my_llm_name:
+                return backbone_key
+        if "kimi" in my_llm_name.lower():
+            return "EXPENSIVE"
+        return "CHEAP"
 
     def estimate_plan(
         self,

@@ -1,10 +1,10 @@
-from src.agent.operator import Operator, OperatorPlan, OperatorCEResult, LLMBackbone, RewriteAction
+from src.agent.operator import Operator, OperatorPlan, OperatorCEResult, LLMBackbone, RewriteAction, CognitiveType
 from src.agent.operator_planning_agent import OperatorPlanningAgent
 from src.agent.operator_ce_agent import OperatorCEAgent
 from src.agent.operator_rewriter import OperatorRewriter, RuleBasedRewriter, LLMRewriter
 
 __all__ = [
-    "Operator", "OperatorPlan", "OperatorCEResult", "LLMBackbone", "RewriteAction",
+    "Operator", "OperatorPlan", "OperatorCEResult", "LLMBackbone", "RewriteAction", "CognitiveType",
     "OperatorPlanningAgent", "OperatorCEAgent", "OperatorRewriter", "RuleBasedRewriter",
     "LLMRewriter",
 ]

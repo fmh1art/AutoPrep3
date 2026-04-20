@@ -21,9 +21,14 @@ Based on this operator, predict:
 
 [MEMORY_PLACEHOLDER]
 
+**Cognitive Type Annotations:**
+- `perception`: Extracting facts from code — search, locate, read, run existing tests. Usually predictable, CHEAP model handles well.
+- `reasoning`: Deriving conclusions — root cause analysis, solution design. Requires deep thinking, CHEAP model often struggles.
+- `action`: Modifying code based on conclusions — edit, implement. Reliability depends on task complexity.
+
 **Important considerations for model capability:**
-- Model A (doubao-flash) is the weaker model: it may need more steps and retries for complex tasks, leading to higher uncertainty
-- Model B (doubao) is the stronger model: can handle complex tasks efficiently with fewer retries
+- CHEAP model: good at perception tasks. Struggles with reasoning and complex action tasks.
+- EXPENSIVE model: handles all cognitive types well. Most valuable for reasoning and complex action tasks.
 
 Output your estimation as a JSON code block:
 ```json

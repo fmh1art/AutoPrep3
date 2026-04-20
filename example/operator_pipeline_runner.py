@@ -182,6 +182,8 @@ def main():
     parser.add_argument("--ce-config", type=str, default=None, help="CE LLM config (yaml)")
     parser.add_argument("--rewrite-config", type=str, default=None, help="Rewrite LLM config (yaml)")
     parser.add_argument("--config-dir", type=str, default="./_config", help="Config directory")
+    parser.add_argument("--cheap-config", type=str, default=None, help="CHEAP backbone LLM config (yaml). Defaults to doubao.yaml")
+    parser.add_argument("--expensive-config", type=str, default=None, help="EXPENSIVE backbone LLM config (yaml). Defaults to kimi2.5.yaml")
     parser.add_argument("--no-ce", action="store_true", help="Disable cost estimation")
     parser.add_argument("--no-rewrite", action="store_true", help="Disable plan rewriting")
     parser.add_argument("--no-rule-rewrite", action="store_true", help="Disable rule-based rewriting")
@@ -191,15 +193,45 @@ def main():
     parser.add_argument(
         "--trajectory-passing-mode",
         type=str,
-        default="trajectory",
-        choices=["trajectory", "description", "finish_only"],
+        default="hybrid",
+        choices=["trajectory", "description", "finish_only", "hybrid", "selective", "append"],
         help=(
             "How to pass context between operators: "
-            "'trajectory' = pass raw accumulated messages as prefix; "
+            "'trajectory' = pass compressed accumulated messages as prefix; "
             "'description' = pass only operator descriptions and finish messages as text; "
-            "'finish_only' = pass only finish messages from previous operators as text"
+            "'finish_only' = pass only finish messages from previous operators as text; "
+            "'hybrid' = trajectory for implement operators, description for explore/verify; "
+            "'selective' = pass only useful trajectory steps selected by previous operator; "
+            "'append' = pass raw accumulated messages as prefix (no compression)"
         ),
     )
+    parser.add_argument(
+        "--selective-max-retries",
+        type=int,
+        default=2,
+        help="Max retries for getting useful_trajectory_indexes in selective mode",
+    )
+    parser.add_argument(
+        "--selective-fallback-rule",
+        type=str,
+        default="last_half",
+        choices=["all", "last_half", "last_third", "none"],
+        help="Fallback rule when agent fails to provide useful_trajectory_indexes",
+    )
+    parser.add_argument(
+        "--force-backbone",
+        type=str,
+        default=None,
+        choices=["CHEAP", "EXPENSIVE", "B", "C"],
+        help="Force all operators to use this backbone tier (overrides planner/CE/rewrite decisions)",
+    )
+    parser.add_argument(
+        "--fallback-upgrade",
+        action="store_true",
+        default=True,
+        help="Auto-retry with stronger model when A model hits max steps",
+    )
+    parser.add_argument("--no-fallback-upgrade", action="store_false", dest="fallback_upgrade")
     parser.add_argument("--parallel", type=int, default=1, help="Parallel workers")
     parser.add_argument("--output-dir", type=str, default=None, help="Output directory")
     parser.add_argument("--http-proxy", type=str, default=None, help="HTTP proxy")
@@ -217,12 +249,23 @@ def main():
         args.rewrite_config = args.planner_config
     args.config_dir = _resolve_path(args.config_dir)
 
+    cheap_config_path = _resolve_path(args.cheap_config) if args.cheap_config else None
+    expensive_config_path = _resolve_path(args.expensive_config) if args.expensive_config else None
+
     with open(args.planner_config, "r", encoding="utf-8") as f:
         planner_cfg = yaml.safe_load(f)
     with open(args.ce_config, "r", encoding="utf-8") as f:
         ce_cfg = yaml.safe_load(f)
     with open(args.rewrite_config, "r", encoding="utf-8") as f:
         rewrite_cfg = yaml.safe_load(f)
+
+    llm_configs = {}
+    if cheap_config_path:
+        with open(cheap_config_path, "r", encoding="utf-8") as f:
+            llm_configs["CHEAP"] = yaml.safe_load(f)
+    if expensive_config_path:
+        with open(expensive_config_path, "r", encoding="utf-8") as f:
+            llm_configs["EXPENSIVE"] = yaml.safe_load(f)
 
     if args.output_dir is None:
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
@@ -238,6 +281,7 @@ def main():
         "planner_cfg": planner_cfg,
         "ce_cfg": ce_cfg,
         "rewrite_cfg": rewrite_cfg,
+        "llm_configs": llm_configs if llm_configs else None,
         "config_dir": args.config_dir,
         "use_ce": not args.no_ce,
         "use_rewrite": not args.no_rewrite,
@@ -246,6 +290,10 @@ def main():
         "max_steps_per_operator": args.max_steps_per_operator,
         "max_rewrite_rounds": args.max_rewrite_rounds,
         "trajectory_passing_mode": args.trajectory_passing_mode,
+        "fallback_upgrade": args.fallback_upgrade,
+        "selective_max_retries": args.selective_max_retries,
+        "selective_fallback_rule": args.selective_fallback_rule,
+        "force_backbone": args.force_backbone,
     }
 
     runner_config = {

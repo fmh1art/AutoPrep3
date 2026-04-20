@@ -97,13 +97,36 @@ TOOL_DEFINITIONS = [
         "type": "function",
         "function": {
             "name": "finish",
-            "description": "Call this tool when the task is complete. Include a summary message.",
+            "description": (
+                "Call this tool when the task is complete. Include a summary message "
+                "and the indexes of trajectory steps that were useful for completing the task."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
                         "description": "Final summary message describing what was done.",
+                    },
+                    "useful_trajectory_indexes": {
+                        "type": "array",
+                        "items": {"type": "integer"},
+                        "description": (
+                            "CRITICAL: Select ONLY the MINIMUM set of steps that the next operator "
+                            "MUST see to continue effectively. Aim for at most 3-5 steps.\n\n"
+                            "INCLUDE only steps that:\n"
+                            "- Made the key code change (the actual file_editor str_replace)\n"
+                            "- Revealed the root cause or critical code location\n"
+                            "- Contain test results that confirm the fix works\n\n"
+                            "EXCLUDE steps that:\n"
+                            "- Were exploration/browsing (even if useful to you, the next operator "
+                            "can re-explore if needed)\n"
+                            "- Were failed attempts or debugging dead-ends\n"
+                            "- Were redundant (same information available in a later step)\n"
+                            "- Were simple commands like ls, pwd, cat without new findings\n\n"
+                            "IMPORTANT: Only include indexes from YOUR OWN steps. "
+                            "Do NOT include indexes from previous operators."
+                        ),
                     },
                 },
                 "required": ["message"],
@@ -209,6 +232,7 @@ class CodeAgent:
         trajectory: list[dict] = []
         usage_before = self.caller.get_total_usage()
         finish_message = ""
+        useful_trajectory_indexes: list[int] = []
 
         for step in range(self.max_steps):
             logger.info(f"[CodeAgent] Step {step}")
@@ -217,6 +241,14 @@ class CodeAgent:
             step_usage = self.caller.get_last_usage()
 
             assistant_msg = self._response_to_dict(response_msg)
+            if assistant_msg.get("tool_calls"):
+                for tc in assistant_msg["tool_calls"]:
+                    try:
+                        args = json.loads(tc["function"]["arguments"])
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                    args["_trajectory_step_index"] = step
+                    tc["function"]["arguments"] = json.dumps(args, ensure_ascii=False)
             messages.append(assistant_msg)
 
             thinking = response_msg.content or ""
@@ -254,6 +286,11 @@ class CodeAgent:
 
                 if tool_name == "finish":
                     finish_message = tool_args.get("message", "")
+                    raw_indexes = tool_args.get("useful_trajectory_indexes")
+                    if isinstance(raw_indexes, list):
+                        useful_trajectory_indexes = [
+                            i for i in raw_indexes if isinstance(i, int)
+                        ]
                     observation = f"Agent finished: {finish_message}"
                     finished = True
                 else:
@@ -270,6 +307,8 @@ class CodeAgent:
                     "timestamp": time.time(),
                     "finish_message": finish_message if finished else None,
                 }
+                if finished:
+                    record["useful_trajectory_indexes"] = useful_trajectory_indexes
                 trajectory.append(record)
                 if callbacks:
                     for cb in callbacks:
@@ -286,7 +325,10 @@ class CodeAgent:
             self._save_snapshot(out_dir, step, messages, trajectory)
 
             if finished:
-                logger.info(f"[CodeAgent] Finished at step {step}")
+                logger.info(
+                    f"[CodeAgent] Finished at step {step}, "
+                    f"useful indexes: {useful_trajectory_indexes}"
+                )
                 break
         else:
             logger.warning("[CodeAgent] Reached max steps without finishing")
@@ -300,7 +342,10 @@ class CodeAgent:
             metrics=metrics,
             conversation=None,
             messages=messages,
-            other_content={"finish_message": finish_message},
+            other_content={
+                "finish_message": finish_message,
+                "useful_trajectory_indexes": useful_trajectory_indexes,
+            },
         )
 
     def _call_llm(self, messages: list[dict]):
