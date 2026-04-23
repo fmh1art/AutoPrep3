@@ -33,6 +33,10 @@ from src.benchmarks.utils.dataset import get_dataset
 
 from src.agent.code_agent import CodeAgent, AgentResult
 from src.agent.code_agent_plan_mode import CodeAgentPlanMode
+try:
+    from src.agent.code_agent_optimized import CodeAgentOptimized
+except ImportError:
+    CodeAgentOptimized = None
 
 from openhands.workspace import DockerWorkspace
 from src.tools.funcs import render_j2
@@ -58,8 +62,17 @@ class _AnsiTee:
 
     @staticmethod
     def _should_keep_line(line: str) -> bool:
-        if line.startswith("[DOCKER]") and '"name": "uvicorn.access"' in line:
-            return False
+        if line.startswith("[DOCKER]"):
+            if '"name": "uvicorn.access"' in line:
+                return False
+            if '"levelname": "DEBUG"' in line:
+                return False
+            if '/api/bash/bash_events/search' in line:
+                return False
+            if '/api/file_editor/file_editor_events/search' in line:
+                return False
+            if '/api/health' in line:
+                return False
         return True
 
     def _write_to_streams(self, data: str) -> int:
@@ -112,10 +125,19 @@ def instance_log_context(log_path: str):
     if previous_level > logging.INFO:
         root_logger.setLevel(logging.INFO)
 
+    suppressed_loggers = []
+    for name in ("uvicorn.access", "uvicorn.error", "httpcore", "httpx"):
+        lg = logging.getLogger(name)
+        prev = lg.level
+        lg.setLevel(logging.WARNING)
+        suppressed_loggers.append((name, prev))
+
     try:
         with tee_console_output(log_path):
             yield
     finally:
+        for name, prev in suppressed_loggers:
+            logging.getLogger(name).setLevel(prev)
         root_logger.removeHandler(handler)
         handler.close()
         if previous_level > logging.INFO:
@@ -276,6 +298,7 @@ class SweBenchRunner:
         use_plan_mode: bool = False,
         use_cost_estimation: bool = False,
         num_candidate_plans: int = 3,
+        use_optimized_agent: bool = False,
     ):
         self.exp_cfg = exp_cfg
         self.cheap_exp_cfg = cheap_exp_cfg
@@ -286,6 +309,7 @@ class SweBenchRunner:
         self.use_plan_mode = use_plan_mode
         self.use_cost_estimation = use_cost_estimation
         self.num_candidate_plans = num_candidate_plans
+        self.use_optimized_agent = use_optimized_agent
         self.main_log_path = configure_main_logger(self.tmp_root)
         self._setup_proxy_env()
 
@@ -526,8 +550,20 @@ class SweBenchRunner:
                     num_candidate_plans=self.num_candidate_plans,
                 )
             else:
-                logger.info(f"Using CodeAgent for {instance_id}")
-                code_agent = CodeAgent(llm_cfg=self.exp_cfg)
+                if self.use_optimized_agent:
+                    if CodeAgentOptimized is None:
+                        raise RuntimeError(
+                            "CodeAgentOptimized is not importable; "
+                            "check src/agent/code_agent_optimized.py."
+                        )
+                    logger.info(f"Using CodeAgentOptimized for {instance_id}")
+                    code_agent = CodeAgentOptimized(
+                        llm_cfg=self.exp_cfg,
+                        repo_path=repo_path,
+                    )
+                else:
+                    logger.info(f"Using CodeAgent for {instance_id}")
+                    code_agent = CodeAgent(llm_cfg=self.exp_cfg)
                 agent_result = code_agent.run(
                     instruction=task_description,
                     workspace=workspace,

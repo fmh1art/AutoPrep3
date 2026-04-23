@@ -1,18 +1,30 @@
 """
 并行运行SWE-bench评估的脚本
+
+支持三种模式：
+  1. baseline CodeAgent / CodeAgentOptimized（默认）
+  2. CodeAgentPlanMode（--use-plan-mode）
+  3. PlanningExecutionPipeline（--use-planning-execution）
 """
 
 import argparse
 import json
 import os
+import sys
 import time
+import traceback
+import uuid
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
 import yaml
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import logging
 from src.benchmarks.swe_bench_runner import SweBenchRunner
 from src.benchmarks.utils.log_setup import configure_main_logger
+from src.tools.funcs import render_j2
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +33,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _resolve_path(value: str, fallback_base: Path | None = None) -> str:
-    """Resolve CLI path to absolute path with repository-root fallback."""
     p = Path(value)
     if p.is_absolute():
         return str(p)
@@ -36,8 +47,11 @@ def _resolve_path(value: str, fallback_base: Path | None = None) -> str:
     return str((REPO_ROOT / p).resolve())
 
 
+# ---------------------------------------------------------------------------
+# Baseline / PlanMode worker
+# ---------------------------------------------------------------------------
+
 def run_single_instance(args_dict):
-    """运行单个实例的worker函数"""
     instance = args_dict['instance']
     runner_config = args_dict['runner_config']
 
@@ -53,7 +67,6 @@ def run_single_instance(args_dict):
         return result
     except Exception as e:
         logger.error(f"[Worker] Error in {instance_id}: {e}")
-        import traceback
         return {
             "instance_id": instance_id,
             "error": str(e),
@@ -68,6 +81,134 @@ def run_single_instance(args_dict):
                 logger.warning(f"[Worker] Cleanup failed for {instance_id}: {cleanup_err}")
 
 
+# ---------------------------------------------------------------------------
+# PlanningExecution worker
+# ---------------------------------------------------------------------------
+
+def run_single_instance_planning_execution(args_dict):
+    instance = args_dict["instance"]
+    runner_config = args_dict["runner_config"]
+    pipeline_config = args_dict["pipeline_config"]
+
+    instance_id = instance["instance_id"]
+    logger.info(f"[Worker-PE] Starting {instance_id}")
+
+    workspace = None
+    try:
+        runner = SweBenchRunner(**runner_config)
+        workspace = runner.prepare_workspace(instance)
+
+        repo_name = instance["repo"].split("/")[-1]
+        repo_path = f"/workspace/{repo_name}"
+        base_commit = instance["base_commit"]
+        repo_url = f"https://github.com/{instance['repo']}.git"
+
+        repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
+        logger.info(f"[Worker-PE] Cloning {repo_url} @ {base_commit} into {repo_path}")
+        clone_result = workspace.execute_command(
+            f"rm -rf {repo_path} && "
+            f"git init {repo_path} && "
+            f"cd {repo_path} && "
+            f"git remote add origin {repo_url} && "
+            f"git fetch --depth 1 origin {base_commit}",
+            timeout=float(repo_prepare_timeout),
+        )
+        if clone_result.exit_code != 0:
+            raise RuntimeError(
+                f"git fetch failed for {instance_id}: {clone_result.stderr or clone_result.stdout}"
+            )
+
+        checkout_result = workspace.execute_command(
+            f"cd {repo_path} && git checkout --detach FETCH_HEAD",
+            timeout=120.0,
+        )
+        if checkout_result.exit_code != 0:
+            raise RuntimeError(
+                f"git checkout failed for {instance_id}: {checkout_result.stderr or checkout_result.stdout}"
+            )
+
+        logger.info(f"[Worker-PE] Repository cloned successfully for {instance_id}")
+
+        task_description = render_j2(
+            template_name="query.j2",
+            context={
+                "repo_path": repo_path,
+                "problem_statement": str(instance.get("problem_statement", "")).strip(),
+                "base_commit": instance["base_commit"],
+            },
+        )
+
+        from src.agent.planning_execution import PlanningExecutionPipeline
+
+        pipeline = PlanningExecutionPipeline(**pipeline_config)
+
+        pipeline_result = pipeline.run(
+            instruction=task_description,
+            workspace=workspace,
+            repo_path=repo_path,
+            output_dir=os.path.join(runner_config["tmp_root"], "log", instance_id),
+        )
+
+        from src.benchmarks.swebench.constants import GIT_COMMIT_MESSAGE, GIT_USER_EMAIL, GIT_USER_NAME
+
+        workspace.execute_command(f"cd {repo_path} && git add -A")
+        workspace.execute_command(
+            f"cd {repo_path} && "
+            f"git config --global user.email '{GIT_USER_EMAIL}' && "
+            f"git config --global user.name '{GIT_USER_NAME}' && "
+            f"git commit --no-verify -m '{GIT_COMMIT_MESSAGE}' || true"
+        )
+
+        diff_result = workspace.execute_command(
+            f"cd {repo_path} && git --no-pager diff --no-color {instance['base_commit']} HEAD"
+        )
+        git_patch = diff_result.stdout if diff_result.exit_code == 0 else ""
+
+        from src.benchmarks.swebench.swe_eval import run_swebench_eval
+
+        eval_result = run_swebench_eval(
+            instance=instance,
+            git_patch=git_patch,
+            run_id=str(uuid.uuid4())[:8],
+            tmp_dir=runner_config["tmp_root"],
+        )
+
+        result = {
+            "instance_id": instance_id,
+            "git_patch": git_patch,
+            "metrics": pipeline_result.metrics,
+            "resolved": eval_result.get("resolved", False),
+            "patch_applied": eval_result.get("patch_applied", False),
+            "plan_ops": len(pipeline_result.plan.operators) if pipeline_result.plan else 0,
+        }
+
+        logger.info(
+            f"[Worker-PE] Completed {instance_id}: resolved={result['resolved']}, "
+            f"plan_ops={result['plan_ops']}"
+        )
+        return result
+
+    except Exception as e:
+        logger.error(f"[Worker-PE] Error in {instance_id}: {e}")
+        traceback.print_exc()
+        return {
+            "instance_id": instance_id,
+            "error": str(e),
+            "traceback": traceback.format_exc(),
+            "resolved": False,
+        }
+    finally:
+        if workspace is not None:
+            try:
+                workspace.cleanup()
+            except Exception as cleanup_err:
+                logger.warning(f"[Worker-PE] Cleanup failed for {instance_id}: {cleanup_err}")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(description="并行运行SWE-bench评估")
     parser.add_argument("--dataset", type=str, required=True, help="数据集路径")
@@ -76,9 +217,43 @@ def main():
     parser.add_argument("--selected-instances", type=str, default=None, help="选定实例文件")
     parser.add_argument("--exp-config", type=str, required=True, help="主模型配置文件")
     parser.add_argument("--cheap-config", type=str, required=True, help="便宜模型配置文件")
-    parser.add_argument("--use-plan-mode", action="store_true", help="使用Plan-Execution Agent")
+    parser.add_argument("--use-plan-mode", action="store_true", help="使用Plan-Execution Agent (CodeAgentPlanMode)")
     parser.add_argument("--use-cost-estimation", action="store_true", help="使用Cost Estimation优化plan选择")
     parser.add_argument("--num-candidate-plans", type=int, default=3, help="候选plan数量")
+    parser.add_argument(
+        "--use-optimized-agent",
+        action="store_true",
+        help="使用执行优化版 CodeAgentOptimized（仅在未开启 --use-plan-mode 和 --use-planning-execution 时生效）",
+    )
+
+    # PlanningExecutionPipeline 参数
+    parser.add_argument(
+        "--use-planning-execution",
+        action="store_true",
+        help="使用 PlanningExecutionPipeline（planning agent + operator execution）",
+    )
+    parser.add_argument("--llm-config", type=str, default=None, help="LLM config (yaml). Defaults to --exp-config")
+    parser.add_argument("--max-steps-per-operator", type=int, default=30, help="Max steps per operator")
+    parser.add_argument(
+        "--trajectory-passing-mode",
+        type=str,
+        default="description",
+        choices=["append", "selective", "description"],
+        help=(
+            "How to pass context between operators: "
+            "'append' = pass raw accumulated messages as prefix; "
+            "'selective' = pass only useful trajectory steps selected by previous operator; "
+            "'description' = pass only operator descriptions and finish messages as text"
+        ),
+    )
+    parser.add_argument(
+        "--selective-fallback-rule",
+        type=str,
+        default="last_half",
+        choices=["all", "last_half", "last_third", "none"],
+        help="Fallback rule when agent fails to provide useful_trajectory_indexes in selective mode",
+    )
+
     parser.add_argument("--prompt-path", type=str, default="./src/prompts/query.j2", help="Prompt模板")
     parser.add_argument("--parallel", type=int, default=8, help="并行数")
     parser.add_argument("--output-dir", type=str, default=None, help="输出目录")
@@ -86,7 +261,7 @@ def main():
     parser.add_argument("--no-proxy", type=str, default="localhost,127.0.0.1,::1", help="No proxy")
     args = parser.parse_args()
 
-    # Normalize to absolute paths so worker subprocesses don't depend on cwd.
+    # Normalize to absolute paths
     args.exp_config = _resolve_path(args.exp_config)
     args.cheap_config = _resolve_path(args.cheap_config)
     args.prompt_path = _resolve_path(args.prompt_path, fallback_base=REPO_ROOT / "src" / "prompts")
@@ -103,10 +278,92 @@ def main():
     os.makedirs(args.output_dir, exist_ok=True)
     main_log_path = configure_main_logger(args.output_dir)
 
-    logger.info(f"Output: {args.output_dir}, Parallel: {args.parallel}, PlanMode: {args.use_plan_mode}")
+    logger.info(
+        f"Output: {args.output_dir}, Parallel: {args.parallel}, "
+        f"PlanMode: {args.use_plan_mode}, "
+        f"PlanningExecution: {args.use_planning_execution}, "
+        f"OptimizedAgent: {args.use_optimized_agent}"
+    )
     logger.info(f"Main log file: {main_log_path}")
 
-    # 准备runner配置
+    # ---- PlanningExecutionPipeline mode ----
+    if args.use_planning_execution:
+        llm_config_path = _resolve_path(args.llm_config) if args.llm_config else args.exp_config
+        with open(llm_config_path, "r", encoding="utf-8") as f:
+            llm_cfg = yaml.safe_load(f)
+
+        runner_config = {
+            "exp_cfg": exp_cfg,
+            "cheap_exp_cfg": cheap_cfg,
+            "tmp_root": args.output_dir,
+            "prompt_path": args.prompt_path,
+            "http_proxy": args.http_proxy,
+            "no_proxy": args.no_proxy,
+        }
+
+        pipeline_config = {
+            "llm_cfg": llm_cfg,
+            "max_steps_per_operator": args.max_steps_per_operator,
+            "trajectory_passing_mode": args.trajectory_passing_mode,
+            "selective_fallback_rule": args.selective_fallback_rule,
+        }
+
+        runner = SweBenchRunner(**runner_config)
+        instances = runner.prepare_instances(
+            dataset=args.dataset,
+            split=args.split,
+            eval_limit=args.eval_limit,
+            selected_instances_file=args.selected_instances,
+        )
+        logger.info(f"Total instances: {len(instances)}")
+
+        tasks = [
+            {
+                "instance": inst,
+                "runner_config": runner_config,
+                "pipeline_config": pipeline_config,
+            }
+            for inst in instances
+        ]
+
+        results = []
+        if args.parallel <= 1:
+            for task in tasks:
+                result = run_single_instance_planning_execution(task)
+                results.append(result)
+        else:
+            worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))
+            with ProcessPoolExecutor(max_workers=args.parallel) as executor:
+                futures = {
+                    executor.submit(run_single_instance_planning_execution, task): task
+                    for task in tasks
+                }
+                for future in as_completed(futures):
+                    task = futures[future]
+                    instance_id = task["instance"]["instance_id"]
+                    try:
+                        result = future.result(timeout=worker_timeout)
+                    except TimeoutError:
+                        logger.error(f"Timeout for {instance_id}")
+                        result = {"instance_id": instance_id, "error": "timeout", "resolved": False}
+                    except Exception as e:
+                        logger.error(f"Future failed for {instance_id}: {e}")
+                        result = {"instance_id": instance_id, "error": str(e), "resolved": False}
+                    results.append(result)
+
+        output_file = os.path.join(args.output_dir, "results.json")
+        with open(output_file, "w") as f:
+            json.dump(results, f, indent=2, ensure_ascii=False)
+
+        resolved = sum(1 for r in results if r.get("resolved", False))
+        total = len(results)
+        if total > 0:
+            logger.info(f"Resolved: {resolved}/{total} ({resolved / total * 100:.1f}%)")
+
+        logger.info(f"Results saved to {output_file}")
+        return
+
+    # ---- Baseline / PlanMode ----
     runner_config = {
         "exp_cfg": exp_cfg,
         "cheap_exp_cfg": cheap_cfg,
@@ -117,10 +374,10 @@ def main():
         "use_plan_mode": args.use_plan_mode,
         "use_cost_estimation": args.use_cost_estimation,
         "num_candidate_plans": args.num_candidate_plans,
+        "use_optimized_agent": args.use_optimized_agent,
     }
-    logger.info(f"Runner config: {runner_config}")  # Log the runner configuration for debugging
+    logger.info(f"Runner config: {runner_config}")
 
-    # 加载实例
     runner = SweBenchRunner(**runner_config)
     instances = runner.prepare_instances(
         dataset=args.dataset,
@@ -129,14 +386,12 @@ def main():
         selected_instances_file=args.selected_instances
     )
     logger.info(f"Total instances: {len(instances)}")
-    logger.info(f"The instances are: {[inst['instance_id'] for inst in instances]}")  # Log instance IDs for debugging
+    logger.info(f"The instances are: {[inst['instance_id'] for inst in instances]}")
 
-    # 准备任务
     tasks = [{"instance": inst, "runner_config": runner_config} for inst in instances]
 
-    # 并行执行
     results = []
-    worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))  # 默认2小时超时
+    worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))
     with ProcessPoolExecutor(max_workers=args.parallel) as executor:
         futures = {executor.submit(run_single_instance, task): task for task in tasks}
         for future in as_completed(futures):
@@ -154,8 +409,6 @@ def main():
                 future.cancel()
             except Exception as e:
                 logger.error(f"[Worker] Future failed for {instance_id}: {e}")
-                import traceback
-
                 result = {
                     "instance_id": instance_id,
                     "error": str(e),
@@ -165,12 +418,10 @@ def main():
             results.append(result)
             logger.info(f"Progress: {len(results)}/{len(instances)}")
 
-    # 保存结果
     output_file = os.path.join(args.output_dir, "results.json")
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2)
 
-    # 统计
     resolved = sum(1 for r in results if r.get("resolved", False))
     if results:
         logger.info(f"Resolved: {resolved}/{len(results)} ({resolved/len(results)*100:.1f}%)")
@@ -183,17 +434,9 @@ if __name__ == "__main__":
 
 
 """
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/kimi2.5.yaml \
-  --cheap-config _config/kimi2.5.yaml \
-  --parallel 16 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org" \
-      
-      
+# ============================================================
+# Baseline CodeAgent
+# ============================================================
 python example/benchmark_code_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
   --split test \
@@ -201,6 +444,84 @@ python example/benchmark_code_agent.py \
   --exp-config _config/doubao.yaml \
   --cheap-config _config/doubao.yaml \
   --parallel 16 \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+
+# ============================================================
+# CodeAgentOptimized
+# ============================================================
+python example/benchmark_code_agent.py \
+  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/doubao.yaml \
+  --cheap-config _config/doubao.yaml \
+  --parallel 16 \
+  --use-optimized-agent \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+
+# ============================================================
+# PlanningExecutionPipeline — doubao, description mode
+# ============================================================
+python example/benchmark_code_agent.py \
+  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/doubao.yaml \
+  --cheap-config _config/doubao.yaml \
+  --parallel 16 \
+  --use-planning-execution \
+  --llm-config _config/doubao.yaml \
+  --trajectory-passing-mode description \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+
+# ============================================================
+# PlanningExecutionPipeline — doubao, selective mode
+# ============================================================
+python example/benchmark_code_agent.py \
+  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/doubao.yaml \
+  --cheap-config _config/doubao.yaml \
+  --parallel 16 \
+  --use-planning-execution \
+  --llm-config _config/doubao.yaml \
+  --trajectory-passing-mode selective \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+
+# ============================================================
+# PlanningExecutionPipeline — doubao, append mode
+# ============================================================
+python example/benchmark_code_agent.py \
+  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/doubao.yaml \
+  --cheap-config _config/doubao.yaml \
+  --parallel 16 \
+  --use-planning-execution \
+  --llm-config _config/doubao.yaml \
+  --trajectory-passing-mode append \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+
+# ============================================================
+# Quick test — single instance
+# ============================================================
+python example/benchmark_code_agent.py \
+  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+  --split test \
+  --eval-limit 1 \
+  --exp-config _config/doubao.yaml \
+  --cheap-config _config/doubao.yaml \
+  --parallel 1 \
+  --use-planning-execution \
+  --llm-config _config/doubao.yaml \
+  --trajectory-passing-mode description \
   --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
   --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 """

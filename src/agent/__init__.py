@@ -1,20 +1,22 @@
-from src.agent.operator import Operator, OperatorPlan, OperatorCEResult, LLMBackbone, RewriteAction, CognitiveType
-from src.agent.operator_planning_agent import OperatorPlanningAgent
-from src.agent.operator_ce_agent import OperatorCEAgent
-from src.agent.operator_rewriter import OperatorRewriter, RuleBasedRewriter, LLMRewriter
+from src.agent.planning_execution import (
+    PlanningExecutionPipeline,
+    PipelineResult,
+    PlanningAgent,
+    OperatorExecutor,
+    Operator,
+    OperatorPlan,
+    OperatorExecResult,
+)
 
 __all__ = [
-    "Operator", "OperatorPlan", "OperatorCEResult", "LLMBackbone", "RewriteAction", "CognitiveType",
-    "OperatorPlanningAgent", "OperatorCEAgent", "OperatorRewriter", "RuleBasedRewriter",
-    "LLMRewriter",
+    "PlanningExecutionPipeline",
+    "PipelineResult",
+    "PlanningAgent",
+    "OperatorExecutor",
+    "Operator",
+    "OperatorPlan",
+    "OperatorExecResult",
 ]
-
-try:
-    from src.agent.operator_execution_agent import OperatorExecutionAgent, OperatorExecResult
-    from src.agent.operator_pipeline import OperatorPipeline, PipelineResult
-    __all__.extend(["OperatorExecutionAgent", "OperatorExecResult", "OperatorPipeline", "PipelineResult"])
-except ImportError:
-    pass
 
 try:
     from src.agent.code_agent import CodeAgent, AgentResult
@@ -22,5 +24,11 @@ try:
     from src.agent.ce_memorizer import CEMemorizer
     from src.agent.cost_estimate import CEAgent
     __all__.extend(["CodeAgent", "CodeAgentPlanMode", "AgentResult", "CEMemorizer", "CEAgent"])
+except ImportError:
+    pass
+
+try:
+    from src.agent.code_agent_optimized import CodeAgentOptimized
+    __all__.extend(["CodeAgentOptimized"])
 except ImportError:
     pass

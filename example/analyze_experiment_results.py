@@ -25,8 +25,8 @@ BASE = "/home/fanmeihao/projects/AutoPrep3_PlanRewrite/_tmp"
 EXPERIMENTS = {
     "Baseline A (doubao-flash)": "exp_baseline_A",
     "Baseline B (doubao)": "exp_baseline_B",
-    "Baseline C (kimi-k2.5)": "exp_baseline_C",
-    "Operator Pipeline v2": "exp_operator_pipeline_trajectory_v2",
+    "Pipeline Description": "exp_operator_pipeline_description",
+    "Pipeline Trajectory v2": "exp_operator_pipeline_trajectory_v2",
 }
 
 PRICE_PER_TOKEN = {
@@ -140,12 +140,12 @@ def analyze():
         print(f"  {name:<35} tokens={t:>12,}  cost=${c:>8.4f}  vs_B_tokens={ratio:.1f}%")
 
     # ========================================================================
-    # 3. Operator Pipeline v2 详细分析
+    # 3. Pipeline 详细分析 (Trajectory v2)
     # ========================================================================
-    pipeline_name = "Operator Pipeline v2"
+    pipeline_name = "Pipeline Trajectory v2"
     pipeline_data = all_data.get(pipeline_name, {})
     if pipeline_data and pipeline_data.get("results"):
-        print("\n## 3. Operator Pipeline v2 详细分析\n")
+        print("\n## 3. Pipeline Trajectory v2 详细分析\n")
 
         results = pipeline_data["results"]
 
@@ -261,7 +261,7 @@ def analyze():
     print(header)
     print("  " + "-" * (40 + 17 * len(EXPERIMENTS) + 12))
 
-    pipeline_short = "Operator Pipeline v2"
+    pipeline_short = "Pipeline Trajectory v2"
     baseline_b_short = "Baseline B (doubao)"
 
     for iid in all_instance_ids:

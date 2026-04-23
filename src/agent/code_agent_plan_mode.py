@@ -147,8 +147,8 @@ class CodeAgentPlanMode:
     def scan_workspace(
         workspace: DockerWorkspace,
         repo_path: str = "/workspace",
-        max_files: int = 300,
-        max_files_per_dir: int = 50,
+        max_files: int = 150,
+        max_files_per_dir: int = 30,
         timeout: float = 60.0,
     ) -> str:
         SCAN_SCRIPT = r"""
@@ -175,24 +175,28 @@ SKIP_DIRS = {
     '.agents_tmp', '.venv', 'venv', 'env',
 }
 
+LOW_PRIORITY_DIRS = {
+    'doc', 'docs', 'documentation', 'tutorials',
+    'benchmarks', 'benchmark', 'perf', 'performance',
+    'test', 'tests', 'testing', 'testdata',
+    'scripts', 'ci',
+    'assets', 'images', 'figures', 'plots',
+    'data', 'dataset', 'datasets', 'fixtures'
+}
+
+def is_low_priority(rel_path):
+    parts = rel_path.replace('\\', '/').split('/')
+    return any(p in LOW_PRIORITY_DIRS for p in parts)
+
 total_files_on_disk = 0
 for dp, dns, fns in os.walk(repo):
     dns[:] = [d for d in dns if d not in SKIP_DIRS]
     total_files_on_disk += len(fns)
 
-use_per_dir_limit = total_files_on_disk > max_files
-
-entries = []
-skipped_dirs = {}
+all_entries = []
 for dirpath, dirnames, filenames in os.walk(repo):
     dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-    dir_count = 0
-    dir_total = len(filenames)
     for fname in filenames:
-        if use_per_dir_limit and dir_count >= max_per_dir:
-            rel_dir = os.path.relpath(dirpath, repo)
-            skipped_dirs[rel_dir] = dir_total - dir_count
-            break
         fpath = os.path.join(dirpath, fname)
         rel = os.path.relpath(fpath, repo)
         ext = os.path.splitext(fname)[1].lower()
@@ -202,32 +206,39 @@ for dirpath, dirnames, filenames in os.walk(repo):
             size = -1
         is_binary = ext in BINARY_EXTS or size > 2*1024*1024
         lines = -1
-        tokens = -1
         if not is_binary and size >= 0 and size <= 512*1024:
             try:
                 with open(fpath, 'r', errors='ignore') as f:
                     content = f.read()
                 lines = content.count('\n') + (1 if content and not content.endswith('\n') else 0)
-                tokens = len(content) // 4
             except Exception:
                 pass
-        entries.append({
+        all_entries.append({
             'path': rel,
             'size': size,
             'lines': lines,
-            'tokens': tokens,
             'binary': is_binary,
+            'low_priority': is_low_priority(rel),
         })
-        dir_count += 1
-        if len(entries) >= max_files:
-            if dir_count < dir_total:
-                rel_dir = os.path.relpath(dirpath, repo)
-                skipped_dirs[rel_dir] = dir_total - dir_count
-            break
-    if len(entries) >= max_files:
-        break
 
-print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "skipped_dirs": skipped_dirs}))
+high = [e for e in all_entries if not e['low_priority']]
+low = [e for e in all_entries if e['low_priority']]
+
+dir_counts = {}
+for e in all_entries:
+    top = e['path'].replace('\\', '/').split('/')[0]
+    if top not in dir_counts:
+        dir_counts[top] = {'total': 0, 'source': 0}
+    dir_counts[top]['total'] += 1
+    if not e['low_priority']:
+        dir_counts[top]['source'] += 1
+
+print(json.dumps({
+    "high_priority": high,
+    "low_priority": low,
+    "total_on_disk": total_files_on_disk,
+    "dir_counts": dir_counts,
+}))
 """
         cmd = (
             f"python3 -c {shlex.quote(SCAN_SCRIPT)} "
@@ -240,57 +251,71 @@ print(json.dumps({"entries": entries, "total_on_disk": total_files_on_disk, "ski
                 return f"(workspace scan failed, working directory: {repo_path})"
 
             scan_data = json.loads(result.stdout.strip())
-            entries = scan_data["entries"]
+            high_priority = scan_data["high_priority"]
+            low_priority = scan_data["low_priority"]
             total_on_disk = scan_data["total_on_disk"]
-            skipped_dirs = scan_data.get("skipped_dirs", {})
+            dir_counts = scan_data.get("dir_counts", {})
         except Exception as e:
             logger.warning(f"Workspace scan error: {e}")
             return f"(workspace scan error: {e}, working directory: {repo_path})"
 
-        lines_out: list[str] = [f"Workspace root: {repo_path}"]
-        lines_out.append(f"Total files on disk: {total_on_disk}")
-        lines_out.append(f"Files listed: {len(entries)}")
-        if total_on_disk > max_files:
-            lines_out.append(f"(per-directory cap: {max_files_per_dir} files)")
-        lines_out.append("")
-        lines_out.append(f"{'Path':<60} {'Size':>8} {'Lines':>7} {'Tokens':>8} {'Type':>6}")
-        lines_out.append("-" * 95)
+        out: list[str] = [f"Workspace root: {repo_path}"]
+        out.append(f"Total files: {total_on_disk}")
 
+        sorted_dirs = sorted(dir_counts.items(), key=lambda x: x[1]['source'], reverse=True)
+        out.append("")
+        out.append("Directory structure (source/total files):")
+        for dir_name, counts in sorted_dirs[:20]:
+            src = counts['source']
+            tot = counts['total']
+            if src > 0:
+                out.append(f"  {dir_name}/  ({src} source, {tot} total)")
+            else:
+                out.append(f"  {dir_name}/  ({tot} files, non-source)")
+        if len(sorted_dirs) > 20:
+            out.append(f"  ... and {len(sorted_dirs) - 20} more directories")
+
+        out.append("")
+        out.append("Source files (most relevant for code changes):")
+        out.append(f"{'Path':<62} {'Lines':>6}")
+        out.append("-" * 70)
+
+        shown = 0
         current_dir = None
-        for e in entries:
+        for e in high_priority:
+            if shown >= max_files:
+                remaining = len(high_priority) - shown
+                if remaining > 0:
+                    out.append(f"  ... ({remaining} more source files omitted)")
+                break
             entry_dir = os.path.dirname(e["path"]) or "."
             if entry_dir != current_dir:
                 current_dir = entry_dir
-                skipped_count = skipped_dirs.get(current_dir, 0)
-                if skipped_count > 0:
-                    if current_dir != ".":
-                        lines_out.append(
-                            f"  ... ({skipped_count} more files in {current_dir}/ omitted)"
-                        )
-
-            size_str = f"{e['size']}B" if e["size"] >= 0 else "?"
             lines_str = str(e["lines"]) if e["lines"] >= 0 else "-"
-            tokens_str = str(e["tokens"]) if e["tokens"] >= 0 else "-"
-            type_str = "binary" if e["binary"] else "text"
             path_display = e["path"]
-            if len(path_display) > 58:
-                path_display = "..." + path_display[-55:]
-            lines_out.append(
-                f"{path_display:<60} {size_str:>8} {lines_str:>7} {tokens_str:>8} {type_str:>6}"
-            )
+            if len(path_display) > 60:
+                path_display = "..." + path_display[-57:]
+            out.append(f"{path_display:<62} {lines_str:>6}")
+            shown += 1
 
-        for sd, cnt in skipped_dirs.items():
-            if cnt > 0 and sd not in {
-                os.path.dirname(e["path"]) or "." for e in entries
-            }:
-                lines_out.append(f"  ... ({cnt} more files in {sd}/ omitted)")
+        if low_priority:
+            out.append("")
+            out.append(f"Other files ({len(low_priority)} total, showing up to {max_files_per_dir}):")
+            out.append(f"{'Path':<62} {'Lines':>6}")
+            out.append("-" * 70)
+            shown_lp = 0
+            for e in low_priority:
+                if shown_lp >= max_files_per_dir:
+                    out.append(f"  ... ({len(low_priority) - shown_lp} more omitted)")
+                    break
+                lines_str = str(e["lines"]) if e["lines"] >= 0 else "-"
+                path_display = e["path"]
+                if len(path_display) > 60:
+                    path_display = "..." + path_display[-57:]
+                out.append(f"{path_display:<62} {lines_str:>6}")
+                shown_lp += 1
 
-        if len(entries) >= max_files:
-            lines_out.append(
-                f"\n(truncated at {max_files} files, {total_on_disk} total on disk)"
-            )
-
-        return "\n".join(lines_out)
+        return "\n".join(out)
 
     # ----------------------------
     # JSON plan parsing & serialization

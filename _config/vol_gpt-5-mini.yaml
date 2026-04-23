@@ -1,7 +1,7 @@
 api_version: 2024-03-01-preview
+openai_base_url: https://search.bytedance.net/gpt/openapi/online/v2/crawl
 key: K8Iwh3LaSiScQQX5HQMBFnbH2zXZtQV7
 llm_name: gpt-5-mini-2025-08-07
-openai_base_url: https://search.bytedance.net/gpt/openapi/online/v2/crawl
 
 price_dollar_per_token:
   input_token: 0.00000075
