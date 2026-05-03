@@ -173,3 +173,140 @@ def calculate_multi_step_cost_without_prefix(token_lis: list, inp_price: int, ou
         prev_obs = obs
 
     return total_cost
+
+
+def _parse_tool_args_for_display(tool_args):
+    if isinstance(tool_args, dict):
+        if "_raw" in tool_args:
+            try:
+                parsed = json.loads(tool_args["_raw"])
+                return {k: v for k, v in parsed.items() if k != "_trajectory_step_index"}
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {k: v for k, v in tool_args.items() if k != "_trajectory_step_index"}
+    if isinstance(tool_args, str):
+        try:
+            parsed = json.loads(tool_args)
+            return {k: v for k, v in parsed.items() if k != "_trajectory_step_index"}
+        except (json.JSONDecodeError, TypeError):
+            return {"_raw": tool_args}
+    return {}
+
+
+def render_trajectory_md(trajectory: list[dict], extra_info: dict | None = None) -> str:
+    lines: list[str] = []
+    lines.append("# Agent Trajectory\n")
+
+    if extra_info:
+        for k, v in extra_info.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+
+    for record in trajectory:
+        idx = record.get("index", "?")
+        role = record.get("role", "?")
+
+        if role == "initial_prompt":
+            lines.append("## Initial Prompt\n")
+            msgs = record.get("messages", [])
+            for mi, m in enumerate(msgs):
+                m_role = m.get("role", "?")
+                m_content = m.get("content", "")
+                if m_content is None:
+                    m_content = ""
+                m_content = str(m_content)
+                tool_calls = m.get("tool_calls", [])
+                tool_call_id = m.get("tool_call_id", "")
+
+                if m_role == "system":
+                    lines.append(f"### [{mi}] System\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+                elif m_role == "user":
+                    lines.append(f"### [{mi}] User\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+                elif m_role == "assistant":
+                    m_reasoning = m.get("reasoning_content", "")
+                    lines.append(f"### [{mi}] Assistant\n")
+                    if m_reasoning:
+                        lines.append(f"<details><summary>Reasoning</summary>\n\n{m_reasoning}\n\n</details>\n")
+                    if m_content:
+                        lines.append(f"**Content:** {m_content}\n")
+                    if tool_calls:
+                        for tci, tc in enumerate(tool_calls):
+                            fn = tc.get("function", {})
+                            tc_name = fn.get("name", "?")
+                            tc_args = fn.get("arguments", "")
+                            lines.append(f"**Tool Call {tci}: `{tc_name}`**\n")
+                            try:
+                                args_parsed = json.loads(tc_args)
+                                args_display = {k: v for k, v in args_parsed.items() if k != "_trajectory_step_index"}
+                                lines.append(f"```json\n{json.dumps(args_display, ensure_ascii=False, indent=2)}\n```\n")
+                            except (json.JSONDecodeError, TypeError):
+                                lines.append(f"```json\n{tc_args}\n```\n")
+                elif m_role == "tool":
+                    lines.append(f"### [{mi}] Tool Response (id={tool_call_id})\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+                else:
+                    lines.append(f"### [{mi}] {m_role}\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+            continue
+
+        if role == "assistant":
+            thinking = record.get("thinking", "")
+            reasoning = record.get("reasoning", "")
+            lines.append(f"## Step {idx} — Assistant\n")
+            if reasoning:
+                lines.append(f"<details><summary>Reasoning</summary>\n\n{reasoning}\n\n</details>\n")
+            if thinking:
+                lines.append(f"**Thinking:** {thinking}\n")
+            continue
+
+        if role == "tool":
+            tool_name = record.get("tool_name", "?")
+            tool_args = record.get("tool_args", {})
+            observation = record.get("observation", "")
+            thinking = record.get("thinking", "")
+            reasoning = record.get("reasoning", "")
+            finish_msg = record.get("finish_message")
+            useful_idx = record.get("useful_trajectory_indexes")
+
+            lines.append(f"## Step {idx} — Tool: `{tool_name}`\n")
+
+            if reasoning:
+                lines.append(f"<details><summary>Reasoning</summary>\n\n{reasoning}\n\n</details>\n")
+            if thinking:
+                lines.append(f"**Thinking:** {thinking}\n")
+
+            args_display = _parse_tool_args_for_display(tool_args)
+            if args_display:
+                lines.append("**Arguments:**\n")
+                lines.append(f"```json\n{json.dumps(args_display, ensure_ascii=False, indent=2)}\n```\n")
+
+            if observation:
+                lines.append("**Observation:**\n")
+                obs = str(observation)
+                if len(obs) > 2000:
+                    lines.append(f"<details><summary>Observation ({len(obs)} chars)</summary>\n\n```\n{obs}\n```\n\n</details>\n")
+                else:
+                    lines.append(f"```\n{obs}\n```\n")
+
+            if finish_msg:
+                lines.append(f"**Finish Message:** {finish_msg}\n")
+            if useful_idx:
+                lines.append(f"**Useful Trajectory Indexes:** {useful_idx}\n")
+
+            continue
+
+        if role == "transition":
+            lines.append(f"## Transition — Operator {idx} → {idx + 1}\n")
+            content = record.get("content", "")
+            if content:
+                lines.append(f"```\n{content}\n```\n")
+            continue
+
+        lines.append(f"## Step {idx} — {role}\n")
+        content = record.get("content") or record.get("observation") or ""
+        if content:
+            lines.append(f"```\n{content}\n```\n")
+
+    return "\n".join(lines)

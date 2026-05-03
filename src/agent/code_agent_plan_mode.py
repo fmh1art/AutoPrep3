@@ -68,8 +68,6 @@ class CodeAgentPlanMode:
         self,
         planner_cfg: dict | None = None,
         executor_llm: Any | None = None,
-        ce_cfg: dict | None = None,
-        executor_price: dict[str, float] | None = None,
         tools: list | None = None,
         system_prompt_kwargs: dict | None = None,
         planner_llm: Any | None = None,  # Backward compatibility
@@ -83,8 +81,6 @@ class CodeAgentPlanMode:
                 api_version=getattr(planner_llm, "api_version", None),
             )
             self.executor_llm = executor_llm
-            self.ce_cfg = None
-            self.executor_price = {}
             self.tools = tools
             self.system_prompt_kwargs = system_prompt_kwargs or {}
         else:
@@ -96,8 +92,6 @@ class CodeAgentPlanMode:
                 api_version=planner_cfg.get("api_version"),
             )
             self.executor_llm = executor_llm
-            self.ce_cfg = ce_cfg
-            self.executor_price = executor_price or {}
             self.tools = tools
             self.system_prompt_kwargs = system_prompt_kwargs or {}
 
@@ -181,12 +175,82 @@ LOW_PRIORITY_DIRS = {
     'test', 'tests', 'testing', 'testdata',
     'scripts', 'ci',
     'assets', 'images', 'figures', 'plots',
-    'data', 'dataset', 'datasets', 'fixtures'
+    'data', 'dataset', 'datasets', 'fixtures',
+    'examples', 'example',
+}
+
+SOURCE_EXTS = {
+    '.py', '.pyx', '.pxd',
+    '.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs',
+    '.java', '.kt', '.scala', '.groovy',
+    '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp', '.hxx',
+    '.go', '.rs', '.swift', '.m', '.mm',
+    '.rb', '.pl', '.pm', '.lua', '.r', '.R',
+    '.sh', '.bash', '.zsh', '.fish',
+    '.sql',
+}
+
+CONFIG_EXTS = {
+    '.yaml', '.yml', '.json', '.toml', '.ini', '.cfg', '.conf',
+    '.xml', '.properties', '.env', '.dotenv',
+    '.cmake', '.make', '.mk', '.gradle',
+    '.dockerfile',
+}
+
+DOC_EXTS = {
+    '.md', '.rst', '.txt', '.adoc', '.org',
+    '.html', '.css', '.scss', '.less',
 }
 
 def is_low_priority(rel_path):
     parts = rel_path.replace('\\', '/').split('/')
     return any(p in LOW_PRIORITY_DIRS for p in parts)
+
+def relevance_score(entry):
+    score = 0
+    path = entry['path']
+    ext = os.path.splitext(path)[1].lower()
+
+    if entry['binary']:
+        return -100
+
+    if entry['low_priority']:
+        score -= 50
+
+    if ext in SOURCE_EXTS:
+        score += 30
+    elif ext in CONFIG_EXTS:
+        score += 5
+    elif ext in DOC_EXTS:
+        score -= 10
+    else:
+        score -= 20
+
+    depth = path.replace('\\', '/').count('/')
+    if depth <= 1:
+        score += 15
+    elif depth <= 3:
+        score += 5
+
+    basename = os.path.basename(path).lower()
+    high_priority_names = {
+        'main', 'app', 'index', '__init__', 'setup', 'conftest',
+        'config', 'settings', 'manage', 'wsgi', 'asgi',
+        'makefile', 'dockerfile', 'cargo', 'package',
+    }
+    name_no_ext = os.path.splitext(basename)[0]
+    if name_no_ext in high_priority_names:
+        score += 10
+
+    if entry['lines'] > 0:
+        if entry['lines'] <= 50:
+            score += 5
+        elif entry['lines'] <= 500:
+            score += 3
+        elif entry['lines'] > 2000:
+            score -= 3
+
+    return score
 
 total_files_on_disk = 0
 for dp, dns, fns in os.walk(repo):
@@ -221,8 +285,14 @@ for dirpath, dirnames, filenames in os.walk(repo):
             'low_priority': is_low_priority(rel),
         })
 
-high = [e for e in all_entries if not e['low_priority']]
-low = [e for e in all_entries if e['low_priority']]
+for e in all_entries:
+    e['score'] = relevance_score(e)
+
+non_binary = [e for e in all_entries if not e['binary']]
+non_binary.sort(key=lambda e: e['score'], reverse=True)
+
+high = [e for e in non_binary if not e['low_priority']]
+low = [e for e in non_binary if e['low_priority']]
 
 dir_counts = {}
 for e in all_entries:
@@ -230,7 +300,7 @@ for e in all_entries:
     if top not in dir_counts:
         dir_counts[top] = {'total': 0, 'source': 0}
     dir_counts[top]['total'] += 1
-    if not e['low_priority']:
+    if not e['low_priority'] and not e['binary']:
         dir_counts[top]['source'] += 1
 
 print(json.dumps({
@@ -238,6 +308,7 @@ print(json.dumps({
     "low_priority": low,
     "total_on_disk": total_files_on_disk,
     "dir_counts": dir_counts,
+    "non_binary_count": len(non_binary),
 }))
 """
         cmd = (
@@ -254,13 +325,14 @@ print(json.dumps({
             high_priority = scan_data["high_priority"]
             low_priority = scan_data["low_priority"]
             total_on_disk = scan_data["total_on_disk"]
+            non_binary_count = scan_data.get("non_binary_count", total_on_disk)
             dir_counts = scan_data.get("dir_counts", {})
         except Exception as e:
             logger.warning(f"Workspace scan error: {e}")
             return f"(workspace scan error: {e}, working directory: {repo_path})"
 
         out: list[str] = [f"Workspace root: {repo_path}"]
-        out.append(f"Total files: {total_on_disk}")
+        out.append(f"Total files: {total_on_disk} ({non_binary_count} text files)")
 
         sorted_dirs = sorted(dir_counts.items(), key=lambda x: x[1]['source'], reverse=True)
         out.append("")
@@ -275,22 +347,21 @@ print(json.dumps({
         if len(sorted_dirs) > 20:
             out.append(f"  ... and {len(sorted_dirs) - 20} more directories")
 
+        high_budget = max_files if len(high_priority) <= max_files else int(max_files * 0.85)
+        low_budget = max_files_per_dir if len(high_priority) <= max_files else max(0, max_files - high_budget)
+
         out.append("")
-        out.append("Source files (most relevant for code changes):")
+        out.append("Source files (sorted by relevance):")
         out.append(f"{'Path':<62} {'Lines':>6}")
         out.append("-" * 70)
 
         shown = 0
-        current_dir = None
         for e in high_priority:
-            if shown >= max_files:
+            if shown >= high_budget:
                 remaining = len(high_priority) - shown
                 if remaining > 0:
                     out.append(f"  ... ({remaining} more source files omitted)")
                 break
-            entry_dir = os.path.dirname(e["path"]) or "."
-            if entry_dir != current_dir:
-                current_dir = entry_dir
             lines_str = str(e["lines"]) if e["lines"] >= 0 else "-"
             path_display = e["path"]
             if len(path_display) > 60:
@@ -298,14 +369,14 @@ print(json.dumps({
             out.append(f"{path_display:<62} {lines_str:>6}")
             shown += 1
 
-        if low_priority:
+        if low_priority and low_budget > 0:
             out.append("")
-            out.append(f"Other files ({len(low_priority)} total, showing up to {max_files_per_dir}):")
+            out.append(f"Other files ({len(low_priority)} total, showing up to {low_budget}):")
             out.append(f"{'Path':<62} {'Lines':>6}")
             out.append("-" * 70)
             shown_lp = 0
             for e in low_priority:
-                if shown_lp >= max_files_per_dir:
+                if shown_lp >= low_budget:
                     out.append(f"  ... ({len(low_priority) - shown_lp} more omitted)")
                     break
                 lines_str = str(e["lines"]) if e["lines"] >= 0 else "-"
@@ -314,6 +385,9 @@ print(json.dumps({
                     path_display = "..." + path_display[-57:]
                 out.append(f"{path_display:<62} {lines_str:>6}")
                 shown_lp += 1
+        elif low_priority and low_budget == 0:
+            out.append("")
+            out.append(f"({len(low_priority)} non-source files omitted to prioritize relevant code)")
 
         return "\n".join(out)
 
@@ -375,10 +449,6 @@ print(json.dumps({
     # Cost estimation helpers
     # ----------------------------
 
-    @staticmethod
-    def _plan_to_ce_subtasks(plan: list[str]) -> list[dict]:
-        return [{"non_negative_idx": i + 1, "title": s} for i, s in enumerate(plan)]
-
     def run(
         self,
         instruction: str,
@@ -419,13 +489,10 @@ print(json.dumps({
         # ----------------
         # Phase 1: Planning (JSON) via SimpleAPICaller
         # ----------------
-        use_ce = self.ce_cfg is not None and num_candidate_plans > 1
-        effective_num_plans = num_candidate_plans if use_ce else 1
-
         planning_prompt = render_planning_prompt(
             instruction=instruction,
             workspace_overview=workspace_overview,
-            num_candidate_plans=effective_num_plans,
+            num_candidate_plans=1,
         )
 
         try:
@@ -468,14 +535,8 @@ print(json.dumps({
             except Exception as e:
                 logger.warning(f"Failed to append planner trajectory: {e}")
 
-            if use_ce:
-                parsed_plans = self._extract_plans_from_text(raw_response, multi=True)
-                if parsed_plans is None or len(parsed_plans) == 0:
-                    single = self._extract_plans_from_text(raw_response, multi=False)
-                    parsed_plans = [single] if single else None
-            else:
-                single = self._extract_plans_from_text(raw_response, multi=False)
-                parsed_plans = [single] if single else None
+            single = self._extract_plans_from_text(raw_response, multi=False)
+            parsed_plans = [single] if single else None
 
             if parsed_plans is not None:
                 break
@@ -484,7 +545,7 @@ print(json.dumps({
                 retry_msg = (
                     "Your previous response could not be parsed as valid JSON. "
                     "Please output the plan again as a valid JSON code block (```json ... ```).\n"
-                    f"Expected format: {'a JSON array of arrays (each inner array is a list of subtask strings)' if use_ce else 'a JSON array of strings (each string is one subtask)'}.\n"
+                    "Expected format: a JSON array of strings (each string is one subtask).\n"
                     "Do NOT include anything outside the JSON code block."
                 )
                 planner_messages.append({"role": "assistant", "content": raw_response})
@@ -507,140 +568,11 @@ print(json.dumps({
         # ----------------
         # Extract plans from planner text response
         # ----------------
-        ce_metrics: dict[str, Any] = {}
-        ce_all_results: dict[str, Any] = {}
+        json_plan = parsed_plans[0] if parsed_plans else None
 
-        if use_ce:
-            candidate_plans = parsed_plans
-            if candidate_plans is None:
-                logger.warning("Failed to extract any plans after retries, using fallback")
-                candidate_plans = [
-                    ["Analyze the task instruction and implement the required changes"]
-                ]
-
-            logger.info(f"Extracted {len(candidate_plans)} candidate plans")
-            self._write_json(os.path.join(logs_dir, "candidate_plans.json"), candidate_plans)
-
-            # ----------------
-            # Phase 1.5: Cost Estimation (via SimpleAPICaller)
-            # ----------------
-            from src.agent.cost_estimate import CEAgent
-
-            plan_costs: list[dict[str, Any]] = []
-            all_ce_metrics_list: list[dict[str, Any]] = []
-
-            for plan_idx, plan in enumerate(candidate_plans):
-                logger.info(f"Estimating cost for plan {plan_idx} ({len(plan)} subtasks)...")
-                ce_agent = CEAgent(
-                    ce_cfg=self.ce_cfg,
-                    executor_price=self.executor_price,
-                )
-                ce_subtasks = self._plan_to_ce_subtasks(plan)
-                try:
-                    ce_output = ce_agent.estimate_cost(
-                        instruction=instruction,
-                        subtasks=ce_subtasks,
-                    )
-                    ce_results_data = ce_output["ce_results"]
-                    estimated_cost = ce_agent.compute_plan_cost(ce_results_data)
-                    estimated_uncertainty = ce_agent.compute_plan_uncertainty(ce_results_data)
-                    result = {
-                        "plan_index": plan_idx,
-                        "plan": plan,
-                        "estimated_dollar_cost": estimated_cost,
-                        "estimated_uncertainty": estimated_uncertainty,
-                        "ce_results": ce_results_data,
-                        "ce_metrics": ce_output["metrics"],
-                    }
-                    logger.info(
-                        f"Plan {plan_idx}: estimated_dollar_cost={estimated_cost}, uncertainty={estimated_uncertainty}"
-                    )
-                except Exception as e:
-                    logger.error(f"Cost estimation failed for plan {plan_idx}: {e}")
-                    result = {
-                        "plan_index": plan_idx,
-                        "plan": plan,
-                        "estimated_dollar_cost": float("inf"),
-                        "estimated_uncertainty": 1.0,
-                        "ce_results": [],
-                        "ce_metrics": {},
-                        "error": str(e),
-                    }
-                plan_costs.append(result)
-                if result.get("ce_metrics"):
-                    all_ce_metrics_list.append(result["ce_metrics"])
-
-            plan_costs.sort(key=lambda x: x["plan_index"])
-
-            self._write_json(os.path.join(logs_dir, "plan_costs.json"), plan_costs)
-
-            valid_costs = [pc for pc in plan_costs if pc["estimated_dollar_cost"] != float("inf")]
-            if valid_costs:
-                costs = [pc["estimated_dollar_cost"] for pc in valid_costs]
-                min_cost = min(costs)
-
-                for pc in valid_costs:
-                    relative_cost = pc["estimated_dollar_cost"] / max(min_cost, 1e-9)
-                    uncertainty = pc["estimated_uncertainty"]
-
-                    cost_weight = float(os.getenv("CE_COST_WEIGHT", "0.7"))
-                    uncertainty_weight = float(os.getenv("CE_UNCERTAINTY_WEIGHT", "0.3"))
-
-                    cost_score = (relative_cost - 1.0) * cost_weight
-                    uncertainty_score = uncertainty * uncertainty_weight
-
-                    pc["score"] = cost_score + uncertainty_score
-                    pc["relative_cost"] = relative_cost
-                    logger.info(
-                        f"Plan {pc['plan_index']}: "
-                        f"cost={pc['estimated_dollar_cost']:.4f} "
-                        f"(x{relative_cost:.2f}), "
-                        f"uncertainty={uncertainty:.3f}, "
-                        f"score={pc['score']:.3f}"
-                    )
-
-                best = min(valid_costs, key=lambda x: x["score"])
-            else:
-                best = plan_costs[0]
-
-            json_plan = best["plan"]
-            selected_plan_idx = best["plan_index"]
-            logger.info(
-                f"Selected plan {selected_plan_idx} with cost={best['estimated_dollar_cost']}, uncertainty={best.get('estimated_uncertainty', 'N/A')}"
-            )
-
-            ce_all_results = {
-                "candidate_plans_count": len(candidate_plans),
-                "selected_plan_index": selected_plan_idx,
-                "plan_costs": plan_costs,
-            }
-
-            merged_ce = {}
-            for m in all_ce_metrics_list:
-                if m:
-                    if not merged_ce:
-                        merged_ce = dict(m)
-                    else:
-                        for k in (
-                            "prompt_tokens",
-                            "completion_tokens",
-                            "reasoning_tokens",
-                            "cache_read_tokens",
-                            "cache_write_tokens",
-                            "total_tokens",
-                        ):
-                            merged_ce[k] = merged_ce.get(k, 0) + m.get(k, 0)
-                        merged_ce["accumulated_cost"] = merged_ce.get(
-                            "accumulated_cost", 0.0
-                        ) + m.get("accumulated_cost", 0.0)
-            ce_metrics = merged_ce
-
-        else:
-            json_plan = parsed_plans[0] if parsed_plans else None
-
-            if json_plan is None:
-                logger.warning("Failed to extract JSON plan after retries, using fallback")
-                json_plan = ["Analyze the task instruction and implement the required changes"]
+        if json_plan is None:
+            logger.warning("Failed to extract JSON plan after retries, using fallback")
+            json_plan = ["Analyze the task instruction and implement the required changes"]
 
         self._write_json(os.path.join(logs_dir, "plan.json"), json_plan)
         serialized_plan = self._serialize_plan_for_execution(json_plan)
@@ -672,6 +604,7 @@ print(json.dumps({
             llm_cfg=executor_cfg,
             max_steps=100,
             max_retries_per_call=3,
+            include_steps=False,
         )
 
         execution_prompt = render_execution_prompt(
@@ -783,8 +716,6 @@ print(json.dumps({
             "execution": exec_metrics,
             "total": total_metrics,
         }
-        if ce_metrics:
-            token_report["cost_estimation"] = ce_metrics
 
         self._write_json(os.path.join(logs_dir, "token_usage.json"), token_report)
 
@@ -803,10 +734,6 @@ print(json.dumps({
             "execution_summary": _summarize_usage(exec_metrics),
             "total_summary": _summarize_usage(total_metrics),
         }
-        if ce_metrics:
-            results_payload["cost_estimation_summary"] = _summarize_usage(ce_metrics)
-        if ce_all_results:
-            results_payload["cost_estimation_details"] = ce_all_results
         self._write_json(os.path.join(logs_dir, "results.json"), results_payload)
 
         now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -815,7 +742,6 @@ print(json.dumps({
             "",
             f"- Timestamp: {now}",
             f"- Plan subtasks: {len(json_plan)}",
-            f"- Cost estimation enabled: {use_ce}",
             f"- Logs Dir: `{logs_dir}`",
             f"- SWE Eval Dir: `{swe_dir}`",
             "",
@@ -823,11 +749,6 @@ print(json.dumps({
             f"- Planner accumulated_cost: {planner_metrics.get('accumulated_cost', 0.0)}",
             f"- Executor accumulated_cost: {exec_metrics.get('accumulated_cost', 0.0)}",
         ]
-        if ce_metrics:
-            log_lines.append(
-                f"- CostEstimation accumulated_cost: {ce_metrics.get('accumulated_cost', 0.0)}"
-            )
-            log_lines.append(f"- CostEstimation tokens: {_summarize_usage(ce_metrics)}")
         log_lines.extend(
             [
                 f"- Planner tokens: {_summarize_usage(planner_metrics)}",
@@ -842,16 +763,12 @@ print(json.dumps({
             "execution": exec_metrics,
             "total": total_metrics,
         }
-        if ce_metrics:
-            all_metrics["cost_estimation"] = ce_metrics
 
         other: dict[str, Any] = {
             "logs_dir": logs_dir,
             "swe_eval_logs": swe_dir,
             "plan_json": json_plan,
         }
-        if ce_all_results:
-            other["cost_estimation_details"] = ce_all_results
 
         result = AgentResult(
             metrics=all_metrics,

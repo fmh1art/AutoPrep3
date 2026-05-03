@@ -8,9 +8,9 @@ Follow this structure and tone (aligned with the project's prompts style):
    - State clear objectives and acceptance criteria (actionable and verifiable)
    - Define scope and assumptions (what is explicitly out of scope)
 
-2. Implementation Steps (3–8 steps in order)
+2. Implementation Steps (3–6 steps in order)
    For each step, include:
-   - Change Target: files/directories/commands involved
+   - Change Target: high-level description of what needs to change (e.g., "authentication module", "data validation logic")
    - Actions: what to do and which tools/commands to use
    - Expected Outputs: code/files/logs
    - Verification: how to verify success (commands/scripts/cases)
@@ -28,4 +28,27 @@ Task Instruction:
 
 Output Requirement:
 - Write the **full plan** directly into the plan file ({{ plan_path }}) above. Directly overwrite the content of the original file with your new generated content.
+
+## Planning Principles
+
+1. **Keep operators HIGH-LEVEL**: Focus on "what to do" not "how to do it". Do NOT specify exact file paths, line numbers, or function names in the subtask description — let the execution agent explore and discover these during implementation.
+
+2. **Prefer 2-4 operators**: Fewer operators means lower planning cost. One exploration operator + one implementation operator + one verification operator is often sufficient.
+
+3. **Let execution agent handle specifics**: The execution agent has access to exploration tools. Trust it to locate files, read code, and implement changes based on your high-level guidance.
+
+## Good vs Bad Subtask Examples
+
+Good (high-level, reduces planning cost):
+```
+Op 1: "Explore the authentication module to understand the current session handling logic"
+Op 2: "Implement token refresh mechanism to handle expired sessions"
+Op 3: "Add integration tests to verify session refresh behavior"
+```
+
+Bad (too specific, increases planning cost):
+```
+Op 1: "Read /workspace/src/auth/session.py lines 50-100, grep for 'token' across src/, locate TokenRefresh class"
+Op 2: "In /workspace/src/auth/session.py line 75, replace the expired token logic..."
+```
 

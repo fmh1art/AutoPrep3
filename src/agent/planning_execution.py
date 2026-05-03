@@ -1,7 +1,7 @@
 """
 PlanningExecution — Planning-Execution 框架。
 
-Planning Agent 使用工具（bash, search_by_keyword, view_file）探索代码库，输出 operator pipeline。
+Planning Agent 使用单次 LLM query 生成 high-level operator plan。
 每个 operator 由 CodeAgent（或 CodeAgentOptimized）具体执行。
 执行完成后（信号是 finish 工具），将相关执行信息传给下一个 operator。
 
@@ -25,7 +25,7 @@ if TYPE_CHECKING:
     from openhands.workspace import DockerWorkspace
 
 from src.agent.code_agent import CodeAgent, AgentResult
-from src.agent.code_agent_optimized import CodeAgentOptimized
+from src.module.gpt_inference import SimpleAPICaller
 from src.tools.funcs import render_j2
 
 logger = logging.getLogger(__name__)
@@ -94,6 +94,7 @@ class OperatorExecResult:
     files_read: list[str] = field(default_factory=list)
     hit_max_steps: bool = False
     useful_trajectory_indexes: list[int] = field(default_factory=list)
+    trajectory_records: list[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -108,175 +109,21 @@ class PipelineResult:
 # Planning Agent
 # ---------------------------------------------------------------------------
 
-PLANNING_SYSTEM_PROMPT = """\
-You are a planning agent. Your job is to explore the codebase using the available \
-tools (bash, search_by_keyword, view_file), understand the task, and then output a \
-decomposition plan as a sequence of operators.
-
-You should use tools to:
-- Explore the repository structure (bash: ls, find, etc.)
-- Search for relevant code by keyword or filename (search_by_keyword)
-- Read specific files or line ranges (view_file)
-
-When you have enough understanding, call the `finish` tool with your plan in the message.
-
-IMPORTANT RULES:
-- Always use absolute file paths (starting with /).
-- Explore the codebase BEFORE creating the plan — do not plan blindly.
-- Focus on understanding the task requirements and code structure.
-- Do NOT make any code changes — you are only planning, not implementing.
-- Use `search_by_keyword` with search_type="filename" to locate relevant files, \
-then search_type="content" to find specific code within those files, then \
-`view_file` to read the relevant lines.
-- Do NOT call `view_file` repeatedly on the same file with different line ranges \
-to "browse" the file — use `search_by_keyword` to find what you need.
-"""
-
-PLANNING_FINISH_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "finish",
-        "description": (
-            "Call this tool when you have explored the codebase and are ready to output "
-            "your operator plan. The message must contain the plan as a JSON code block."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "message": {
-                    "type": "string",
-                    "description": (
-                        "Your operator plan as a JSON code block (```json ... ```). "
-                        "Each operator must have 'index' and 'subtask' fields. "
-                        "Example: ```json\\n"
-                        '[\\n'
-                        '  {"index": 1, "subtask": "Explore and locate the bug"},\\n'
-                        '  {"index": 2, "subtask": "Implement the fix"},\\n'
-                        '  {"index": 3, "subtask": "Verify the fix with tests"}\\n'
-                        ']\\n'
-                        "```"
-                    ),
-                },
-            },
-            "required": ["message"],
-        },
-    },
-}
-
 
 class PlanningAgent:
     def __init__(self, llm_cfg: dict, max_steps: int = 30):
         self.llm_cfg = llm_cfg
         self.max_steps = max_steps
-        self._agent = CodeAgentOptimized(
-            llm_cfg=llm_cfg,
-            max_steps=max_steps,
-            max_retries_per_call=3,
-            system_prompt=PLANNING_SYSTEM_PROMPT,
-            tool_definitions=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "bash",
-                        "description": (
-                            "Execute a bash command in the Docker workspace. Use `&&` or `;` "
-                            "to chain multiple commands."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "command": {
-                                    "type": "string",
-                                    "description": "The bash command to execute.",
-                                },
-                            },
-                            "required": ["command"],
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "search_by_keyword",
-                        "description": (
-                            "Search by keyword or file name pattern.\n"
-                            "- search_type=\"content\" (default): search a keyword in file "
-                            "contents under a file or directory. Returns matching files "
-                            "ranked by match count, plus matching lines with line numbers.\n"
-                            "- search_type=\"filename\": find files by name glob pattern "
-                            "(e.g. \"*.py\", \"test_*.py\"). Returns matching file paths "
-                            "ranked by proximity to already-modified files."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "keyword": {
-                                    "type": "string",
-                                    "description": (
-                                        "For content search: the keyword (literal, not "
-                                        "regex). For filename search: the glob pattern "
-                                        "(e.g. \"*.py\", \"*session*\")."
-                                    ),
-                                },
-                                "path": {
-                                    "type": "string",
-                                    "description": "Absolute path to a file or directory.",
-                                },
-                                "search_type": {
-                                    "type": "string",
-                                    "enum": ["content", "filename"],
-                                    "description": (
-                                        "\"content\" to search inside files (default), "
-                                        "\"filename\" to find files by name pattern."
-                                    ),
-                                },
-                            },
-                            "required": ["keyword", "path"],
-                        },
-                    },
-                },
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "view_file",
-                        "description": (
-                            "View a range of lines from a file. Output includes line "
-                            "numbers. If start_line and end_line are omitted, shows the "
-                            "first 50 lines (and tells you the total line count so you "
-                            "can request more)."
-                        ),
-                        "parameters": {
-                            "type": "object",
-                            "properties": {
-                                "path": {
-                                    "type": "string",
-                                    "description": "Absolute path to the file.",
-                                },
-                                "start_line": {
-                                    "type": "integer",
-                                    "description": (
-                                        "Start line number (1-indexed). Defaults to 1."
-                                    ),
-                                },
-                                "end_line": {
-                                    "type": "integer",
-                                    "description": (
-                                        "End line number (1-indexed, inclusive). "
-                                        "Defaults to the last line of the file."
-                                    ),
-                                },
-                            },
-                            "required": ["path"],
-                        },
-                    },
-                },
-                PLANNING_FINISH_TOOL,
-            ],
+        self._caller = SimpleAPICaller(
+            llm_name=llm_cfg.get("llm_name", llm_cfg.get("model", "").replace("openai/", "")),
+            api_key=llm_cfg.get("key", llm_cfg.get("api_key", "")),
+            base_url=llm_cfg.get("openai_base_url", llm_cfg.get("base_url", None)),
+            api_version=llm_cfg.get("api_version", None),
         )
 
     @property
     def caller(self):
-        return self._agent.caller
+        return self._caller
 
     def generate_plan(
         self,
@@ -287,15 +134,18 @@ class PlanningAgent:
         repo_path: str = "/workspace",
         output_dir: str | None = None,
     ) -> tuple[OperatorPlan, dict[str, Any]]:
-        usage_before = self.caller.get_total_usage()
+        usage_before = self._caller.get_total_usage()
 
-        prompt = render_j2(
+        user_message = render_j2(
             "planning_agent.j2",
             context={
                 "instruction": instruction,
                 "workspace_overview": workspace_overview,
             },
         )
+        messages = [
+            {"role": "user", "content": user_message},
+        ]
 
         planning_output_dir = None
         if output_dir:
@@ -309,33 +159,34 @@ class PlanningAgent:
                     attempt_dir = os.path.join(planning_output_dir, f"attempt_{attempt}")
                     os.makedirs(attempt_dir, exist_ok=True)
 
-                if workspace is not None:
-                    result: AgentResult = self._agent.run(
-                        instruction=prompt,
-                        workspace=workspace,
-                        output_dir=attempt_dir,
-                    )
-                    raw_response = ""
-                    if result.other_content.get("finish_message"):
-                        raw_response = result.other_content["finish_message"]
-                    if not raw_response and result.messages:
-                        for msg in reversed(result.messages):
-                            if msg.get("role") == "assistant" and msg.get("content"):
-                                raw_response = msg["content"]
-                                break
-                else:
-                    messages: list[dict[str, str]] = [{"role": "user", "content": prompt}]
-                    raw_response = self.caller.chat(messages)
+                if attempt_dir:
+                    with open(os.path.join(attempt_dir, "input.json"), "w", encoding="utf-8") as f:
+                        json.dump(messages, f, ensure_ascii=False, indent=2)
+
+                raw_response = self._caller.chat(messages)
+
+                if attempt_dir:
+                    with open(os.path.join(attempt_dir, "output.txt"), "w", encoding="utf-8") as f:
+                        f.write(raw_response if raw_response else "")
 
                 plan = self._parse_plan(raw_response)
                 if plan is not None and len(plan.operators) > 0:
                     plan.reindex()
+                    if attempt_dir:
+                        with open(os.path.join(attempt_dir, "plan.json"), "w", encoding="utf-8") as f:
+                            json.dump(
+                                [{"index": op.index, "subtask": op.subtask} for op in plan.operators],
+                                f, ensure_ascii=False, indent=2,
+                            )
                     logger.info(
                         f"Operator plan generated: {len(plan.operators)} operators"
                     )
                     metrics = self._compute_metrics(usage_before)
                     return plan, metrics
             except Exception as e:
+                if attempt_dir:
+                    with open(os.path.join(attempt_dir, "error.txt"), "w", encoding="utf-8") as f:
+                        f.write(str(e))
                 logger.error(f"Planning attempt {attempt} failed: {e}")
 
         logger.warning("All planning attempts failed, using fallback plan")
@@ -383,20 +234,130 @@ class PlanningAgent:
 
         return None
 
+    def replan(
+        self,
+        instruction: str,
+        executed_operators: list[dict],
+        remaining_operators: list[dict],
+        selective_trajectory: str = "",
+        workspace_overview: str = "",
+        max_attempts: int = 3,
+        output_dir: str | None = None,
+    ) -> tuple[bool, OperatorPlan | None, dict[str, Any]]:
+        usage_before = self._caller.get_total_usage()
+
+        user_message = render_j2(
+            "planning_agent_replan.j2",
+            context={
+                "instruction": instruction,
+                "executed_operators": executed_operators,
+                "remaining_operators": remaining_operators,
+                "selective_trajectory": selective_trajectory,
+                "workspace_overview": workspace_overview,
+            },
+        )
+        messages = [
+            {"role": "user", "content": user_message},
+        ]
+
+        replan_output_dir = None
+        if output_dir:
+            replan_output_dir = os.path.join(output_dir, "replanning")
+            os.makedirs(replan_output_dir, exist_ok=True)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                attempt_dir = replan_output_dir
+                if replan_output_dir and max_attempts > 1:
+                    attempt_dir = os.path.join(replan_output_dir, f"attempt_{attempt}")
+                    os.makedirs(attempt_dir, exist_ok=True)
+
+                if attempt_dir:
+                    with open(os.path.join(attempt_dir, "input.json"), "w", encoding="utf-8") as f:
+                        json.dump(messages, f, ensure_ascii=False, indent=2)
+
+                raw_response = self._caller.chat(messages)
+
+                if attempt_dir:
+                    with open(os.path.join(attempt_dir, "output.txt"), "w", encoding="utf-8") as f:
+                        f.write(raw_response if raw_response else "")
+
+                modified, new_plan = self._parse_replan(raw_response)
+                if new_plan is not None:
+                    new_plan.reindex()
+                    if attempt_dir:
+                        with open(os.path.join(attempt_dir, "plan.json"), "w", encoding="utf-8") as f:
+                            json.dump(
+                                {"modified": modified, "operators": [{"index": op.index, "subtask": op.subtask} for op in new_plan.operators]},
+                                f, ensure_ascii=False, indent=2,
+                            )
+                    logger.info(
+                        f"Replan result: modified={modified}, "
+                        f"{len(new_plan.operators)} new remaining operators"
+                    )
+                    metrics = self._compute_metrics(usage_before)
+                    return modified, new_plan, metrics
+                elif not modified:
+                    logger.info("Replan result: modified=false (plan unchanged)")
+                    metrics = self._compute_metrics(usage_before)
+                    return False, None, metrics
+            except Exception as e:
+                if attempt_dir:
+                    with open(os.path.join(attempt_dir, "error.txt"), "w", encoding="utf-8") as f:
+                        f.write(str(e))
+                logger.error(f"Replan attempt {attempt} failed: {e}")
+
+        logger.warning("All replan attempts failed, keeping current plan")
+        metrics = self._compute_metrics(usage_before)
+        return False, None, metrics
+
+    def _parse_replan(self, text: str) -> tuple[bool, OperatorPlan | None]:
+        if not text:
+            return False, None
+
+        pattern = r"```json\s*(\{.*?\})\s*```"
+        matches = re.findall(pattern, text, re.DOTALL)
+
+        for m in reversed(matches):
+            try:
+                parsed = json.loads(m)
+                if isinstance(parsed, dict) and "modified" in parsed:
+                    modified = parsed.get("modified", False)
+                    if not modified:
+                        return False, None
+                    operators = parsed.get("operators", [])
+                    if isinstance(operators, list) and len(operators) > 0:
+                        valid = all(
+                            isinstance(item, dict) and "subtask" in item
+                            for item in operators
+                        )
+                        if valid:
+                            return True, OperatorPlan.from_dict_list(operators)
+                    return True, None
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+        try:
+            parsed = json.loads(text.strip())
+            if isinstance(parsed, dict) and "modified" in parsed:
+                modified = parsed.get("modified", False)
+                if not modified:
+                    return False, None
+                operators = parsed.get("operators", [])
+                if isinstance(operators, list) and len(operators) > 0:
+                    return True, OperatorPlan.from_dict_list(operators)
+                return True, None
+        except Exception:
+            pass
+
+        return False, None
+
     @staticmethod
     def _fallback_plan() -> OperatorPlan:
         return OperatorPlan(operators=[
             Operator(
                 index=1,
-                subtask="Explore the codebase to locate relevant files and understand the code structure",
-            ),
-            Operator(
-                index=2,
-                subtask="Analyze the root cause and implement the required changes",
-            ),
-            Operator(
-                index=3,
-                subtask="Run existing tests to verify the changes work correctly",
+                subtask="Complete the entire task end-to-end: explore the codebase, understand the issue, implement the fix, and verify it works",
             ),
         ])
 
@@ -411,11 +372,15 @@ class OperatorExecutor:
     def __init__(
         self,
         llm_cfg: dict,
-        max_steps_per_operator: int = 30,
+        max_steps_per_operator: int = 80,
         max_retries_per_call: int = 3,
         trajectory_passing_mode: str = "description",
-        selective_fallback_rule: str = "last_half",
+        selective_fallback_rule: str = "all",
         use_optimized_agent: bool = False,
+        max_time_per_operator: float | None = None,
+        max_index_validation_retries: int = 2,
+        planning_agent: PlanningAgent | None = None,
+        enable_replanning: bool = False,
     ):
         if trajectory_passing_mode not in self.TRAJECTORY_MODES:
             raise ValueError(
@@ -428,6 +393,10 @@ class OperatorExecutor:
         self.trajectory_passing_mode = trajectory_passing_mode
         self.selective_fallback_rule = selective_fallback_rule
         self.use_optimized_agent = use_optimized_agent
+        self.max_time_per_operator = max_time_per_operator
+        self.max_index_validation_retries = max_index_validation_retries
+        self.planning_agent = planning_agent
+        self.enable_replanning = enable_replanning
 
         self._agent = self._create_agent()
 
@@ -438,11 +407,15 @@ class OperatorExecutor:
                 llm_cfg=self.llm_cfg,
                 max_steps=self.max_steps_per_operator,
                 max_retries_per_call=self.max_retries_per_call,
+                include_steps=False,
+                max_time=self.max_time_per_operator,
             )
         return CodeAgent(
             llm_cfg=self.llm_cfg,
             max_steps=self.max_steps_per_operator,
             max_retries_per_call=self.max_retries_per_call,
+            include_steps=False,
+            max_time=self.max_time_per_operator,
         )
 
     @staticmethod
@@ -455,6 +428,22 @@ class OperatorExecutor:
         return "(operator reached max steps without finishing)"
 
     @staticmethod
+    def _parse_tool_args(tool_args: dict | str) -> dict:
+        if isinstance(tool_args, dict):
+            if "_raw" in tool_args:
+                try:
+                    return json.loads(tool_args["_raw"])
+                except (json.JSONDecodeError, TypeError):
+                    return tool_args
+            return tool_args
+        if isinstance(tool_args, str):
+            try:
+                return json.loads(tool_args)
+            except (json.JSONDecodeError, TypeError):
+                return {}
+        return {}
+
+    @staticmethod
     def _extract_files_from_trajectory(messages: list[dict]) -> tuple[list[str], list[str]]:
         modified = set()
         read = set()
@@ -462,14 +451,15 @@ class OperatorExecutor:
             if msg.get("role") != "tool":
                 continue
             tool_name = msg.get("tool_name", "")
-            tool_args = msg.get("tool_args", {})
+            raw_args = msg.get("tool_args", {})
+            tool_args = OperatorExecutor._parse_tool_args(raw_args)
 
             if tool_name == "file_editor":
                 path = tool_args.get("path", "")
                 command = tool_args.get("command", "")
                 if not path:
                     continue
-                if command in ("str_replace", "insert"):
+                if command in ("str_replace", "insert", "create"):
                     modified.add(path)
                 elif command == "view":
                     read.add(path)
@@ -548,7 +538,6 @@ class OperatorExecutor:
 
         for msg in messages:
             if msg.get("role") == "system":
-                filtered.append(msg)
                 continue
 
             if msg.get("role") == "assistant":
@@ -645,6 +634,7 @@ class OperatorExecutor:
         callbacks: list[Callable] | None = None,
         output_dir: str | None = None,
         trajectory_offset: int = 0,
+        prefix_trajectory: list[dict] | None = None,
     ) -> OperatorExecResult:
         previous_ops = [op for op in plan.operators if op.index < operator.index]
 
@@ -696,8 +686,6 @@ class OperatorExecutor:
             os.makedirs(op_output_dir, exist_ok=True)
 
         try:
-            usage_before = self._agent.caller.get_total_usage()
-
             effective_initial_messages = None
             if self.trajectory_passing_mode == "selective" and initial_messages:
                 effective_initial_messages = initial_messages
@@ -718,6 +706,9 @@ class OperatorExecutor:
                 )
 
             if effective_initial_messages:
+                effective_initial_messages = list(effective_initial_messages) + [
+                    {"role": "user", "content": exec_prompt}
+                ]
                 msg_summary_lines = []
                 for mi, m in enumerate(effective_initial_messages):
                     role = m.get("role", "?")
@@ -758,48 +749,87 @@ class OperatorExecutor:
                     f"  [Op {operator.index}] initial_messages: None (fresh start)"
                 )
 
-            result = self._agent.run(
-                instruction=exec_prompt,
-                workspace=workspace,
-                callbacks=callbacks,
-                output_dir=op_output_dir or output_dir,
-                initial_messages=effective_initial_messages,
-            )
-            usage_after = self._agent.caller.get_total_usage()
+            max_validation_retries = self.max_index_validation_retries
 
-            op_metrics = {
-                "prompt_tokens": usage_after.get("input_tokens", 0) - usage_before.get("input_tokens", 0),
-                "completion_tokens": usage_after.get("output_tokens", 0) - usage_before.get("output_tokens", 0),
-                "cache_read_tokens": usage_after.get("cached_tokens", 0) - usage_before.get("cached_tokens", 0),
-                "reasoning_tokens": usage_after.get("reasoning_tokens", 0) - usage_before.get("reasoning_tokens", 0),
-                "total_tokens": usage_after.get("total_tokens", 0) - usage_before.get("total_tokens", 0),
-                "accumulated_cost": 0.0,
-            }
+            for validation_attempt in range(max_validation_retries + 1):
+                if validation_attempt > 0:
+                    logger.info(
+                        f"  [Op {operator.index}] Retrying operator execution "
+                        f"(attempt {validation_attempt + 1}/{max_validation_retries + 1}) "
+                        f"due to invalid useful_trajectory_indexes..."
+                    )
 
-            finish_msg = ""
-            useful_indexes: list[int] = []
-            if hasattr(result, 'other_content') and isinstance(result.other_content, dict):
-                finish_msg = result.other_content.get("finish_message", "")
-                raw_indexes = result.other_content.get("useful_trajectory_indexes", [])
-                if isinstance(raw_indexes, list):
-                    useful_indexes = [i for i in raw_indexes if isinstance(i, int)]
+                usage_before = self._agent.caller.get_total_usage()
 
-            result_messages = result.messages if hasattr(result, 'messages') else []
-
-            total_steps = len(result_messages) // 2
-            if is_selective and useful_indexes:
-                useful_indexes = self._validate_useful_indexes(
-                    useful_indexes, trajectory_offset, total_steps,
+                result = self._agent.run(
+                    instruction=exec_prompt,
+                    workspace=workspace,
+                    callbacks=callbacks,
+                    output_dir=op_output_dir or output_dir,
+                    initial_messages=effective_initial_messages,
+                    prefix_trajectory=prefix_trajectory,
                 )
-            elif is_selective and not useful_indexes:
-                logger.warning(
-                    f"  [selective] Operator {operator.index} did not provide "
-                    f"useful_trajectory_indexes, applying fallback rule: "
-                    f"{self.selective_fallback_rule}"
-                )
-                useful_indexes = self._apply_fallback_rule(
-                    total_steps, trajectory_offset, self.selective_fallback_rule,
-                )
+                usage_after = self._agent.caller.get_total_usage()
+
+                op_metrics = {
+                    "prompt_tokens": usage_after.get("input_tokens", 0) - usage_before.get("input_tokens", 0),
+                    "completion_tokens": usage_after.get("output_tokens", 0) - usage_before.get("output_tokens", 0),
+                    "cache_read_tokens": usage_after.get("cached_tokens", 0) - usage_before.get("cached_tokens", 0),
+                    "reasoning_tokens": usage_after.get("reasoning_tokens", 0) - usage_before.get("reasoning_tokens", 0),
+                    "total_tokens": usage_after.get("total_tokens", 0) - usage_before.get("total_tokens", 0),
+                    "accumulated_cost": 0.0,
+                }
+
+                finish_msg = ""
+                useful_indexes: list[int] = []
+                if hasattr(result, 'other_content') and isinstance(result.other_content, dict):
+                    finish_msg = result.other_content.get("finish_message", "")
+                    raw_indexes = result.other_content.get("useful_trajectory_indexes", [])
+                    if isinstance(raw_indexes, list):
+                        useful_indexes = [i for i in raw_indexes if isinstance(i, int)]
+
+                useful_indexes = sorted(useful_indexes)
+
+                result_messages = result.messages if hasattr(result, 'messages') else []
+
+                total_steps = len(result_messages) // 2
+
+                invalid_indexes = [idx for idx in useful_indexes if idx < 0 or idx >= total_steps]
+                if invalid_indexes:
+                    if validation_attempt < max_validation_retries:
+                        logger.warning(
+                            f"  [Op {operator.index}] Invalid useful_trajectory_indexes detected: "
+                            f"{invalid_indexes}. Valid range: 0~{max(total_steps - 1, 0)}. "
+                            f"Retrying ({validation_attempt + 1}/{max_validation_retries})..."
+                        )
+                        continue
+                    else:
+                        logger.warning(
+                            f"  [Op {operator.index}] Invalid useful_trajectory_indexes: "
+                            f"{invalid_indexes} after {max_validation_retries} retries. "
+                            f"Filtering out invalid indexes and applying fallback."
+                        )
+                        useful_indexes = [idx for idx in useful_indexes if 0 <= idx < total_steps]
+                        if not useful_indexes:
+                            useful_indexes = self._apply_fallback_rule(
+                                total_steps, trajectory_offset, self.selective_fallback_rule,
+                            )
+
+                if is_selective and useful_indexes:
+                    useful_indexes = self._validate_useful_indexes(
+                        useful_indexes, trajectory_offset, total_steps,
+                    )
+                elif is_selective and not useful_indexes:
+                    logger.warning(
+                        f"  [selective] Operator {operator.index} did not provide "
+                        f"useful_trajectory_indexes, applying fallback rule: "
+                        f"{self.selective_fallback_rule}"
+                    )
+                    useful_indexes = self._apply_fallback_rule(
+                        total_steps, trajectory_offset, self.selective_fallback_rule,
+                    )
+
+                break
 
             hit_max_steps = len(result_messages) >= self.max_steps_per_operator * 2
 
@@ -833,6 +863,10 @@ class OperatorExecutor:
                     f"  [Op {operator.index}] files_read: {files_read}"
                 )
 
+            trajectory_records = []
+            if hasattr(result, 'other_content') and isinstance(result.other_content, dict):
+                trajectory_records = result.other_content.get("trajectory_records", [])
+
             return OperatorExecResult(
                 operator_index=operator.index,
                 operator_subtask=operator.subtask,
@@ -843,6 +877,7 @@ class OperatorExecutor:
                 files_read=files_read,
                 hit_max_steps=hit_max_steps,
                 useful_trajectory_indexes=useful_indexes,
+                trajectory_records=trajectory_records,
             )
 
         except Exception as e:
@@ -852,6 +887,49 @@ class OperatorExecutor:
                 operator_subtask=operator.subtask,
                 error=str(e),
             )
+
+    @staticmethod
+    def _build_selective_trajectory_text(
+        result: OperatorExecResult,
+        max_step_chars: int = 1500,
+    ) -> str:
+        if not result.trajectory_records:
+            if result.finish_message:
+                return f"Finish summary: {result.finish_message[:max_step_chars]}"
+            return ""
+
+        useful_idx = set(result.useful_trajectory_indexes)
+        parts = []
+        for rec in result.trajectory_records:
+            rec_idx = rec.get("index", -999)
+            if rec_idx not in useful_idx:
+                continue
+            rec_role = rec.get("role", "")
+            if rec_role == "assistant":
+                tool_calls = rec.get("tool_calls", [])
+                if tool_calls:
+                    for tc in tool_calls:
+                        tc_fn = tc.get("function", {})
+                        tc_name = tc_fn.get("name", "")
+                        tc_args_str = tc_fn.get("arguments", "{}")
+                        try:
+                            tc_args = json.loads(tc_args_str)
+                        except (json.JSONDecodeError, TypeError):
+                            tc_args = {}
+                        tc_args.pop("_trajectory_step_index", None)
+                        parts.append(f"Step {rec_idx} [tool_call]: {tc_name}({json.dumps(tc_args, ensure_ascii=False)[:200]})")
+                content = rec.get("content", "")
+                if content:
+                    parts.append(f"Step {rec_idx} [thinking]: {content[:max_step_chars]}")
+            elif rec_role == "tool":
+                content = rec.get("content", "")
+                if content:
+                    parts.append(f"Step {rec_idx} [tool_result]: {content[:max_step_chars]}")
+
+        if not parts and result.finish_message:
+            return f"Finish summary: {result.finish_message[:max_step_chars]}"
+
+        return "\n".join(parts)
 
     # ---- Execute the full plan ----
 
@@ -863,13 +941,22 @@ class OperatorExecutor:
         repo_path: str = "/workspace",
         callbacks: list[Callable] | None = None,
         output_dir: str | None = None,
-    ) -> list[OperatorExecResult]:
+        workspace_overview: str = "",
+    ) -> tuple[list[OperatorExecResult], OperatorPlan, list[dict[str, Any]]]:
         results: list[OperatorExecResult] = []
         selective_messages: list[dict] = []
         accumulated_messages: list[dict] = []
         previous_operator_summaries: list[dict] = []
+        prefix_trajectory: list[dict] = []
+        replanning_metrics_list: list[dict[str, Any]] = []
 
-        for i, operator in enumerate(plan.operators):
+        current_plan = plan
+        executed_count = 0
+
+        while executed_count < len(current_plan.operators):
+            operator = current_plan.operators[executed_count]
+            i = executed_count
+
             initial_messages = None
             if self.trajectory_passing_mode == "selective" and i > 0 and selective_messages:
                 initial_messages = list(selective_messages)
@@ -884,7 +971,7 @@ class OperatorExecutor:
 
             result = self.execute_operator(
                 operator=operator,
-                plan=plan,
+                plan=current_plan,
                 instruction=instruction,
                 workspace=workspace,
                 repo_path=repo_path,
@@ -893,8 +980,10 @@ class OperatorExecutor:
                 callbacks=callbacks,
                 output_dir=output_dir,
                 trajectory_offset=0,
+                prefix_trajectory=list(prefix_trajectory) if prefix_trajectory else None,
             )
             results.append(result)
+            executed_count += 1
 
             all_messages = result.messages
 
@@ -957,10 +1046,120 @@ class OperatorExecutor:
                 "files_read": result.files_read,
             })
 
+            if result.trajectory_records:
+                useful_idx = result.useful_trajectory_indexes
+                useful_records = []
+                for rec in result.trajectory_records:
+                    rec_role = rec.get("role", "")
+                    rec_idx = rec.get("index", -999)
+                    if rec_role in ("tool", "assistant") and rec_idx in useful_idx:
+                        useful_records.append(rec)
+
+                if useful_records:
+                    new_prefix = list(prefix_trajectory)
+                    if new_prefix:
+                        new_prefix.append({
+                            "index": operator.index,
+                            "role": "transition",
+                            "content": f"--- End of Operator {operator.index} ---",
+                        })
+                    new_prefix.append({
+                        "index": operator.index,
+                        "role": "transition",
+                        "content": (
+                            f"Operator {operator.index} completed subtask: "
+                            f"{operator.subtask[:200]}\n\n"
+                            f"Summary: {result.finish_message[:500] if result.finish_message else 'N/A'}"
+                        ),
+                    })
+                    new_prefix.extend(useful_records)
+                    new_prefix.append({
+                        "index": operator.index,
+                        "role": "transition",
+                        "content": f"--- End of Operator {operator.index} useful steps ---",
+                    })
+                    prefix_trajectory = new_prefix
+                    logger.info(
+                        f"  [trajectory] After Op {operator.index}: "
+                        f"prefix_trajectory total={len(prefix_trajectory)} records "
+                        f"(useful from this op: {len(useful_records)})"
+                    )
+                else:
+                    logger.info(
+                        f"  [trajectory] After Op {operator.index}: "
+                        f"no useful trajectory records to pass"
+                    )
+
             if output_dir:
                 self._save_operator_result(output_dir, operator, result)
 
-        return results
+            if self.enable_replanning and self.planning_agent and executed_count < len(current_plan.operators):
+                remaining_ops = current_plan.operators[executed_count:]
+                if remaining_ops:
+                    selective_traj_text = self._build_selective_trajectory_text(result)
+
+                    executed_ops_for_replan = []
+                    for s in previous_operator_summaries:
+                        executed_ops_for_replan.append({
+                            "index": s["index"],
+                            "subtask": s["subtask"],
+                            "finish_message": s["finish_message"],
+                            "files_modified": s["files_modified"],
+                            "files_read": s["files_read"],
+                        })
+
+                    remaining_ops_for_replan = [
+                        {"index": op.index, "subtask": op.subtask}
+                        for op in remaining_ops
+                    ]
+
+                    logger.info(
+                        f"  [replan] Calling planning agent after Op {operator.index} "
+                        f"({len(remaining_ops)} remaining operators)..."
+                    )
+
+                    replan_dir = None
+                    if output_dir:
+                        replan_dir = os.path.join(output_dir, f"replan_after_op_{operator.index}")
+                        os.makedirs(replan_dir, exist_ok=True)
+
+                    modified, new_remaining_plan, replan_metrics = self.planning_agent.replan(
+                        instruction=instruction,
+                        executed_operators=executed_ops_for_replan,
+                        remaining_operators=remaining_ops_for_replan,
+                        selective_trajectory=selective_traj_text,
+                        workspace_overview=workspace_overview,
+                        output_dir=replan_dir,
+                    )
+                    replanning_metrics_list.append(replan_metrics)
+
+                    if modified and new_remaining_plan is not None:
+                        last_executed_index = operator.index
+                        for new_op in new_remaining_plan.operators:
+                            last_executed_index += 1
+                            new_op.index = last_executed_index
+
+                        new_plan_ops = list(current_plan.operators[:executed_count]) + list(new_remaining_plan.operators)
+                        current_plan = OperatorPlan(operators=new_plan_ops)
+
+                        logger.info(
+                            f"  [replan] Plan UPDATED after Op {operator.index}! "
+                            f"New plan has {len(current_plan.operators)} operators "
+                            f"(was {executed_count + len(remaining_ops)}):"
+                        )
+                        for op in current_plan.operators:
+                            marker = "✓" if op.index <= operator.index else "→"
+                            logger.info(f"    {marker} Op {op.index}: {op.subtask[:80]}")
+
+                        if output_dir:
+                            with open(os.path.join(output_dir, f"replan_after_op_{operator.index}", "new_plan.json"), "w", encoding="utf-8") as f:
+                                json.dump(current_plan.to_dict_list(), f, ensure_ascii=False, indent=2)
+                    else:
+                        logger.info(
+                            f"  [replan] Plan unchanged after Op {operator.index}"
+                        )
+
+        return results, current_plan, replanning_metrics_list
 
     def _save_operator_result(
         self,
@@ -1014,12 +1213,16 @@ class PlanningExecutionPipeline:
     def __init__(
         self,
         llm_cfg: dict,
-        max_steps_per_operator: int = 30,
+        max_steps_per_operator: int = 80,
         trajectory_passing_mode: str = "description",
-        selective_fallback_rule: str = "last_half",
+        selective_fallback_rule: str = "all",
         use_optimized_agent: bool = False,
+        max_time_per_operator: float | None = None,
+        max_index_validation_retries: int = 2,
+        enable_replanning: bool = False,
     ):
         self.trajectory_passing_mode = trajectory_passing_mode
+        self.enable_replanning = enable_replanning
 
         self.planning_agent = PlanningAgent(llm_cfg=llm_cfg)
 
@@ -1029,6 +1232,10 @@ class PlanningExecutionPipeline:
             trajectory_passing_mode=trajectory_passing_mode,
             selective_fallback_rule=selective_fallback_rule,
             use_optimized_agent=use_optimized_agent,
+            max_time_per_operator=max_time_per_operator,
+            max_index_validation_retries=max_index_validation_retries,
+            planning_agent=self.planning_agent if enable_replanning else None,
+            enable_replanning=enable_replanning,
         )
 
     @staticmethod
@@ -1082,18 +1289,33 @@ class PlanningExecutionPipeline:
             logger.info(f"  Op {op.index}: {op.subtask[:80]}")
 
         logger.info("[PlanningExecution] Executing operator plan...")
-        exec_results = self.executor.execute_plan(
+        exec_results, final_plan, replanning_metrics_list = self.executor.execute_plan(
             plan=plan,
             instruction=instruction,
             workspace=workspace,
             repo_path=repo_path,
             callbacks=callbacks,
             output_dir=logs_dir,
+            workspace_overview=workspace_overview,
         )
 
         exec_total_metrics = OperatorExecutor.compute_total_metrics(exec_results)
 
-        all_phase_metrics = [planning_metrics, exec_total_metrics["total"]]
+        replanning_total_metrics = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "cache_read_tokens": 0,
+            "reasoning_tokens": 0,
+            "total_tokens": 0,
+            "accumulated_cost": 0.0,
+        }
+        for rm in replanning_metrics_list:
+            for k in ("prompt_tokens", "completion_tokens", "cache_read_tokens",
+                       "reasoning_tokens", "total_tokens"):
+                replanning_total_metrics[k] += rm.get(k, 0)
+            replanning_total_metrics["accumulated_cost"] += rm.get("accumulated_cost", 0.0)
+
+        all_phase_metrics = [planning_metrics, exec_total_metrics["total"], replanning_total_metrics]
         total_tokens = {
             "prompt_tokens": sum(m.get("prompt_tokens", 0) for m in all_phase_metrics),
             "completion_tokens": sum(m.get("completion_tokens", 0) for m in all_phase_metrics),
@@ -1106,13 +1328,16 @@ class PlanningExecutionPipeline:
         total_metrics = {
             "planning": planning_metrics,
             "execution": exec_total_metrics["total"],
+            "replanning": replanning_total_metrics,
             "total": total_tokens,
         }
 
         self._write_json(os.path.join(logs_dir, "token_usage.json"), total_metrics)
 
         results_payload = {
-            "plan": plan.to_dict_list(),
+            "plan": final_plan.to_dict_list(),
+            "initial_plan": plan.to_dict_list() if final_plan is not plan else None,
+            "plan_modified": final_plan is not plan,
             "exec_results": [
                 {
                     "operator_index": r.operator_index,
@@ -1131,14 +1356,24 @@ class PlanningExecutionPipeline:
             "# PlanningExecution Run Log",
             "",
             f"- Timestamp: {now}",
-            f"- Plan operators: {len(plan.operators)}",
+            f"- Initial plan operators: {len(plan.operators)}",
+            f"- Final plan operators: {len(final_plan.operators)}",
+            f"- Plan modified during execution: {final_plan is not plan}",
             f"- Trajectory passing mode: {self.trajectory_passing_mode}",
+            f"- Replanning enabled: {self.enable_replanning}",
             f"- Logs Dir: `{logs_dir}`",
             "",
-            "## Plan",
+            "## Initial Plan",
         ]
         for op in plan.operators:
             log_lines.append(f"- Op {op.index}: {op.subtask}")
+        if final_plan is not plan:
+            log_lines.extend([
+                "",
+                "## Final Plan (after replanning)",
+            ])
+            for op in final_plan.operators:
+                log_lines.append(f"- Op {op.index}: {op.subtask}")
         log_lines.extend([
             "",
             "## Execution Summary",
@@ -1153,12 +1388,13 @@ class PlanningExecutionPipeline:
 
         other = {
             "logs_dir": logs_dir,
-            "plan": plan.to_dict_list(),
+            "plan": final_plan.to_dict_list(),
+            "initial_plan": plan.to_dict_list() if final_plan is not plan else None,
         }
 
         return PipelineResult(
             metrics=total_metrics,
-            plan=plan,
+            plan=final_plan,
             exec_results=exec_results,
             other_content=other,
         )

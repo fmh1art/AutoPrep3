@@ -1,36 +1,40 @@
-EVAL_LIMIT=16
-PARALLEL=8
 
+
+# Code Agent baseline
 python example/benchmark_code_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
-  --split test --eval-limit $EVAL_LIMIT \
-  --exp-config _config/doubao.yaml --cheap-config _config/doubao.yaml \
-  --parallel $PARALLEL --use-planning-execution \
-  --llm-config _config/doubao.yaml \
-  --trajectory-passing-mode selective \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org" \
-  --output-dir _tmp/doubao_selective_${EVAL_LIMIT}  
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/kimi_baseline.yaml \
+  --cheap-config _config/kimi_baseline.yaml \
+  --parallel 4 \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 
-
-
+# Optimized Code Agent
 python example/benchmark_code_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
-  --split test --eval-limit $EVAL_LIMIT \
-  --exp-config _config/doubao.yaml --cheap-config _config/doubao.yaml \
-  --parallel $PARALLEL --use-planning-execution \
-  --llm-config _config/doubao.yaml \
-  --trajectory-passing-mode description \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org" \
-  --output-dir _tmp/doubao_description_${EVAL_LIMIT}    
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/kimi_optimized_code_agent.yaml \
+  --cheap-config _config/kimi_optimized_code_agent.yaml \
+  --parallel 4 \
+  --use-optimized-agent \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 
-
-
-python example/benchmark_code_agent.py \
+# Plan Agent
+python example/benchmark_plan_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
-  --split test --eval-limit $EVAL_LIMIT \
-  --exp-config _config/doubao.yaml --cheap-config _config/doubao.yaml \
-  --parallel $PARALLEL --use-planning-execution \
-  --llm-config _config/doubao.yaml \
-  --trajectory-passing-mode append \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org" \
-  --output-dir _tmp/doubao_append_${EVAL_LIMIT}    
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/kimi_coat_agent.yaml \
+  --cheap-config _config/kimi_coat_agent.yaml \
+  --parallel 4 \
+  --max-steps-per-subagent 80 \
+  --max-planning-steps 20 \
+  --max-planning-total-steps 80 \
+  --selective-fallback-rule all \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+

@@ -1,0 +1,57 @@
+You are re-executing **Operator {{ operator_index }}** of {{ total_operators }}. A downstream operator has detected issues and requested a rollback with corrective guidance.
+
+**Your Subtask**: {{ operator_subtask }}
+
+**Your Dependencies (operators whose results are available to you):**
+{% for dep in dependencies %}
+- [Op {{ dep.index }}] (dependency: {{ dep.score }}) {{ dep.subtask }} ✓
+{% endfor %}
+{% if not dependencies %}
+(None — this operator has no dependencies)
+{% endif %}
+
+## ROLLBACK DEBUG INFORMATION
+
+The downstream operator (Op {{ rollback_source_operator }}) reported the following issue:
+
+{{ debug_info }}
+
+**Your Previous Execution Summary:**
+{{ previous_execution_summary }}
+
+## CHECK RELEVANCE BEFORE ACTING
+
+Before you start re-executing, **carefully evaluate** whether the debug information above is actually related to **your** subtask (Op {{ operator_index }}). The rollback targets the following operators: **{{ all_rollback_targets | join(', ') }}**. {% if not is_direct_target %}You are being re-executed as a downstream operator affected by the rollback, **not** as a direct target of the reported issue.{% endif %}{% if is_direct_target and all_rollback_targets | length > 1 %}The rollback targets multiple operators. The issue might only concern some of them, not necessarily you.{% endif %}
+
+**If the debug information is NOT related to your subtask** — for example, it describes a bug or issue in files/code that are outside your operator's scope, or the problem clearly lies in a different operator's responsibility — then **call the `finish` tool immediately** with a message like:
+
+> The reported issue is not related to my subtask. My previous execution was correct and no changes are needed.
+
+**If the debug information IS related to your subtask**, proceed with re-execution and address the specific issues identified.
+
+---
+
+Use the available tools to re-execute your subtask with the necessary corrections. When done, call the `finish` tool with a summary of what you accomplished differently this time.
+
+{% if is_selective %}
+**TRAJECTORY INDEXING (CRITICAL — READ CAREFULLY):**
+Each step in your execution is assigned an index starting from 0. When you call the `finish` tool, you MUST provide the `useful_trajectory_indexes` parameter.
+
+The next operator will receive ONLY the steps you mark as useful. Your goal is to ensure the next operator has enough context to work effectively without re-doing your work.
+
+**INCLUDE steps that contain:**
+1. The step that revealed the bug location — the exact file path, function name, and line number
+2. The step that showed the current code at the bug location — the `view` or `cat` command that displayed the code
+3. The step that made the actual code change(s) — every `str_replace` or `insert` call
+4. The step with the test/verification result — any test run confirming the fix works
+5. The step that revealed related code — any other file/function that must also be changed
+
+**ALWAYS EXCLUDE:**
+- Steps where you ran a command and got an error with no useful information
+- Steps that are pure repetition of earlier findings
+- Steps where you just navigated directories (ls, cd, find with no relevant output)
+
+**Target: 3-8 useful steps.**
+
+Your step indexes start from 0. Step 0 is your first tool call, step 1 is your second, etc.
+{% endif %}

@@ -248,11 +248,11 @@ def initialize() -> None:
 
             _initialized = True
 
-    # Set main-thread defaults (plain formatter, WARNING+ only)
+    # Set main-thread defaults (plain formatter, INFO+ to terminal)
     if not hasattr(_ctx, "console_formatter"):
         _ctx.console_formatter = _PlainFormatter("main")
         _ctx.console_filter = None
-        _ctx.console_level = logging.WARNING
+        _ctx.console_level = logging.INFO
 
 
 @contextmanager
@@ -311,7 +311,7 @@ def instance_context(log_dir: str, instance_id: str) -> Generator[None, None, No
         else:
             _ctx.console_formatter = _PlainFormatter(instance_id)
             _ctx.console_filter = None
-            _ctx.console_level = logging.WARNING
+            _ctx.console_level = logging.INFO
 
         # --- Set up stdout/stderr redirect ---
         output_file = open(  # noqa: SIM115

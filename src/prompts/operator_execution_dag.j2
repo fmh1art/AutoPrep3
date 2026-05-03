@@ -1,32 +1,16 @@
-You are an autonomous coding agent executing a specific operator from a multi-operator plan.
-
-## ⚠️ CRITICAL: YOUR SCOPE IS STRICTLY LIMITED
-
-You are executing **ONLY** operator {{ operator_index }} of total {{ total_operators }} operators. Your **sole** responsibility is the subtask below. Do NOT attempt to solve the entire task — other operators will handle the remaining work.
+You are executing **Operator {{ operator_index }}** of {{ total_operators }}.
 
 **Your Subtask**: {{ operator_subtask }}
 
-**Full Operator Plan Context (for reference only — do NOT execute other operators):**
-{{ operator_plan_serialized }}
-
-**Previous Operators Completed:**
-{% for prev in previous_operators %}
-- [Op {{ prev.index }}] {{ prev.subtask }} ✓
+**Your Dependencies (operators whose results are available to you):**
+{% for dep in dependencies %}
+- [Op {{ dep.index }}] (dependency: {{ dep.score }}) {{ dep.subtask }} ✓
 {% endfor %}
-
-{% if previous_observations %}
-**Key Observations from Previous Operators:**
-{{ previous_observations }}
+{% if not dependencies %}
+(None — this operator has no dependencies)
 {% endif %}
 
-**Original Task Instruction (for context only — you are NOT responsible for the entire task):**
-{{ instruction }}
-
-**Workspace Context:** {{ repo_path }}
-
----
-
-Execute **ONLY** the subtask assigned to you above. When done, call the `finish` tool with a summary of what you accomplished.
+Use the available tools to complete your subtask step by step. When done, call the `finish` tool with a summary of what you accomplished.
 
 {% if is_selective %}
 **TRAJECTORY INDEXING (CRITICAL — READ CAREFULLY):**

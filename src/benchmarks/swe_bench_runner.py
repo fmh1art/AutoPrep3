@@ -560,10 +560,15 @@ class SweBenchRunner:
                     code_agent = CodeAgentOptimized(
                         llm_cfg=self.exp_cfg,
                         repo_path=repo_path,
+                        base_commit=base_commit,
                     )
                 else:
                     logger.info(f"Using CodeAgent for {instance_id}")
-                    code_agent = CodeAgent(llm_cfg=self.exp_cfg)
+                    code_agent = CodeAgent(
+                        llm_cfg=self.exp_cfg,
+                        repo_path=repo_path,
+                        base_commit=base_commit,
+                    )
                 agent_result = code_agent.run(
                     instruction=task_description,
                     workspace=workspace,
@@ -575,6 +580,12 @@ class SweBenchRunner:
             _print_metrics_summary(f"{instance_id}", agent_result.metrics)
 
             # ── 提交 agent 的修改，获取 git patch ─────────────────────────────
+            workspace.execute_command(
+                f"cd {repo_path} && "
+                f"find . -name '*.bak' -delete && "
+                f"find . -name '*.orig' -delete && "
+                f"rm -f reproduce_issue.py test_bug.py test_simple.py test_fix.py"
+            )
             workspace.execute_command(f"cd {repo_path} && git add -A")
             workspace.execute_command(
                 f"cd {repo_path} && "

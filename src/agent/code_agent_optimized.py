@@ -24,6 +24,7 @@ from typing import Any, Callable
 from openhands.workspace import DockerWorkspace
 
 from src.module.gpt_inference import SimpleAPICaller
+from src.tools.funcs import render_j2
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +42,8 @@ MAX_SEARCH_LINE_LENGTH = 200          # search_by_keyword 每行最大字符数
 MAX_FIND_RESULTS = 30                 # find_files 最大返回文件数
 MAX_SIMILAR_SNIPPET_LINES = 20        # string_replace 相似片段最大展示行数
 DEFAULT_VIEW_LINES = 50               # view_file 默认展示行数
+REPEAT_ACTION_THRESHOLD = 5           # 重复 action 自动警告阈值
+TOOL_TIMEOUT_SECONDS = 30             # 非 bash 工具的默认超时
 
 PREINSTALLED_PACKAGES = [
     "requests",
@@ -267,53 +270,10 @@ TOOL_DEFINITIONS = [
 
 def build_system_prompt(repo_path: str) -> str:
     pkgs_str = ", ".join(PREINSTALLED_PACKAGES)
-    return f"""\
-You are an autonomous coding agent running inside a Docker workspace.
-Repository root: {repo_path}
-
-You have access to the following tools:
-  - bash:              run shell commands.
-  - search_by_keyword: search by keyword in file contents, or find files by
-                       name pattern (use search_type="filename").
-  - view_file:         view a range of lines from a file (with line numbers).
-  - string_replace:    safe string-replace edit; also creates new files when
-                       old_string="" and the file does not exist.
-  - undo_edit:         revert the last edit to a file. Each call undoes one
-                       step; call multiple times to undo several edits to
-                       the same file.
-  - finish:            terminate with a summary.
-
-Pre-installed (non-stdlib) packages you can rely on without extra install:
-  {pkgs_str}.
-
-IMPORTANT RULES:
-  - Always use absolute file paths (starting with /).
-  - When editing files, ensure the `old_string` matches EXACTLY (including \
-whitespace and indentation).
-  - Test your changes whenever possible.
-  - Do NOT ask the user for help. Work autonomously.
-  - If you get stuck, try a different approach.
-
-WORKFLOW GUIDELINES:
-  - Use `search_by_keyword` with search_type=\"filename\" to locate relevant \
-files by name, then search_type=\"content\" to find specific code within \
-those files, then `view_file` to read the relevant lines.
-  - ALWAYS use `search_by_keyword` FIRST to locate relevant code before \
-reading or editing. This avoids wasting steps on blind exploration.
-  - After `search_by_keyword` identifies the relevant file and line numbers, \
-use `view_file` to read the specific region you need.
-  - Do NOT call `view_file` repeatedly on the same file with different line \
-ranges to "browse" the file — use `search_by_keyword` to find what you need.
-  - For code edits, prefer `string_replace` over `bash sed`.
-  - To create a new file, use `string_replace` with old_string=\"\".
-  - Whenever a `string_replace` returns multiple matches or a similarity \
-suggestion, follow the protocol (pass `match_indexes` or \
-`confirm_similar=true`).
-  - Do NOT create test scripts or reproduce files (e.g. reproduce_issue.py, \
-test_*.py). Modify the source code directly and verify with the existing \
-test suite.
-  - When the task is complete, call `finish`.
-"""
+    return render_j2("code_agent_optimized_system.j2", context={
+        "repo_path": repo_path,
+        "pkgs_str": pkgs_str,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -350,12 +310,16 @@ class CodeAgentOptimized:
     def __init__(
         self,
         llm_cfg: dict,
-        max_steps: int = 100,
+        max_steps: int = 200,
         max_retries_per_call: int = 3,
         repo_path: str = "/workspace",
+        base_commit: str = "",
         system_prompt: str | None = None,
         tool_definitions: list[dict] | None = None,
         install_preinstalled: bool = False,
+        include_steps: bool = True,
+        max_time: float | None = None,
+        terminating_tools: list[str] | None = None,
     ):
         self.caller = SimpleAPICaller(
             llm_name=llm_cfg["llm_name"],
@@ -366,9 +330,13 @@ class CodeAgentOptimized:
         self.max_steps = max_steps
         self.max_retries_per_call = max_retries_per_call
         self.repo_path = repo_path
+        self.base_commit = base_commit
         self.system_prompt = system_prompt or build_system_prompt(repo_path)
         self.tools = tool_definitions or TOOL_DEFINITIONS
         self.install_preinstalled = install_preinstalled
+        self.include_steps = include_steps
+        self.max_time = max_time
+        self.terminating_tools = set(terminating_tools or [])
 
         # 在运行中绑定：
         self._workspace: DockerWorkspace | None = None
@@ -379,6 +347,7 @@ class CodeAgentOptimized:
         # 每个文件的 undo 栈：path -> list[str]（旧内容，LIFO）
         # 特殊标记：None 表示该 step 之前文件不存在（用于 create_file undo）
         self._undo_stacks: dict[str, list[str | None]] = {}
+        self._action_history: dict[str, int] = {}
 
     # ====================================================================
     # 对外主入口
@@ -391,8 +360,10 @@ class CodeAgentOptimized:
         callbacks: list[Callable] | None = None,
         output_dir: str | None = None,
         initial_messages: list[dict] | None = None,
+        prefix_trajectory: list[dict] | None = None,
     ) -> AgentResult:
         self._workspace = workspace
+        self._action_history = {}
 
         out_dir = output_dir or os.path.abspath("./.agent_outputs_opt")
         os.makedirs(out_dir, exist_ok=True)
@@ -407,6 +378,11 @@ class CodeAgentOptimized:
         messages = self._build_initial_messages(instruction, initial_messages)
 
         trajectory: list[dict] = []
+
+        if prefix_trajectory:
+            for rec in prefix_trajectory:
+                trajectory.append(rec)
+
         init_record = {
             "index": -1,
             "role": "initial_prompt",
@@ -419,8 +395,18 @@ class CodeAgentOptimized:
         usage_before = self.caller.get_total_usage()
         finish_message = ""
         useful_trajectory_indexes: list[int] = []
+        start_time = time.time()
 
         for step in range(self.max_steps):
+            if self.max_time is not None:
+                elapsed = time.time() - start_time
+                if elapsed > self.max_time:
+                    logger.warning(
+                        f"[CodeAgentOptimized] Timeout after {elapsed:.1f}s "
+                        f"(max_time={self.max_time}s) at step {step}"
+                    )
+                    break
+
             logger.info(f"[CodeAgentOptimized] Step {step}")
 
             response_msg = self._call_llm(messages)
@@ -438,6 +424,7 @@ class CodeAgentOptimized:
             messages.append(assistant_msg)
 
             thinking = response_msg.content or ""
+            reasoning_content = getattr(response_msg, "reasoning_content", None) or ""
             tool_calls = response_msg.tool_calls or []
 
             if not tool_calls:
@@ -446,6 +433,7 @@ class CodeAgentOptimized:
                         "index": step,
                         "role": "assistant",
                         "thinking": thinking,
+                        "reasoning": reasoning_content,
                         "usage": step_usage,
                         "timestamp": time.time(),
                     }
@@ -468,6 +456,8 @@ class CodeAgentOptimized:
             seen_calls: set[str] = set()
             executed_count = 0
             skipped_count = 0
+            terminated_tool_name: str | None = None
+            terminated_tool_args: dict = {}
             for tc in tool_calls:
                 tool_name = tc.function.name
                 try:
@@ -483,6 +473,11 @@ class CodeAgentOptimized:
                             i for i in raw if isinstance(i, int)
                         ]
                     observation = f"Agent finished: {finish_message}"
+                    finished = True
+                elif tool_name in self.terminating_tools:
+                    terminated_tool_name = tool_name
+                    terminated_tool_args = tool_args
+                    observation = f"Agent called terminating tool: {tool_name}"
                     finished = True
                 else:
                     call_sig = f"{tool_name}:{tc.function.arguments}"
@@ -523,6 +518,24 @@ class CodeAgentOptimized:
                         tool_name, tool_args, step, workspace
                     )
 
+                    action_sig = f"{tool_name}:{tc.function.arguments}"
+                    self._action_history[action_sig] = self._action_history.get(action_sig, 0) + 1
+                    if self._action_history[action_sig] >= REPEAT_ACTION_THRESHOLD:
+                        logger.warning(
+                            f"[CodeAgentOptimized] Repeated action detected: "
+                            f"{tool_name} has been called {self._action_history[action_sig]} "
+                            f"times with identical arguments"
+                        )
+                        repeat_hint = (
+                            f"[USER WARNING] You have called `{tool_name}` with the exact same arguments "
+                            f"{self._action_history[action_sig]} times. This is likely a loop. "
+                            f"Please STOP repeating the same action and try a different approach. "
+                            f"If the previous result was not what you expected, analyze the observation "
+                            f"carefully and adjust your strategy."
+                        )
+                        messages.append({"role": "user", "content": repeat_hint})
+                        self._action_history[action_sig] = 0
+
                 record = {
                     "index": step,
                     "role": "tool",
@@ -530,6 +543,7 @@ class CodeAgentOptimized:
                     "tool_args": tool_args,
                     "observation": observation,
                     "thinking": thinking,
+                    "reasoning": reasoning_content,
                     "usage": step_usage,
                     "timestamp": time.time(),
                     "finish_message": finish_message if finished else None,
@@ -564,6 +578,18 @@ class CodeAgentOptimized:
                     f"[CodeAgentOptimized] Finished at step {step}, "
                     f"useful indexes: {useful_trajectory_indexes}"
                 )
+
+                if not useful_trajectory_indexes and self._is_selective_mode(messages):
+                    useful_trajectory_indexes = self._prompt_for_useful_indexes(
+                        messages, out_dir, trajectory
+                    )
+
+                break
+
+            if terminated_tool_name:
+                logger.info(
+                    f"[CodeAgentOptimized] Terminating tool '{terminated_tool_name}' called at step {step}"
+                )
                 break
 
             remaining = self.max_steps - step - 1
@@ -586,15 +612,109 @@ class CodeAgentOptimized:
 
         self._save_final(out_dir, trajectory, metrics, finish_message)
 
+        other_content = {
+            "finish_message": finish_message,
+            "useful_trajectory_indexes": useful_trajectory_indexes,
+            "trajectory_records": trajectory,
+        }
+        if terminated_tool_name:
+            other_content["terminated_tool"] = terminated_tool_name
+            other_content["terminated_tool_args"] = terminated_tool_args
+
         return AgentResult(
             metrics=metrics,
             conversation=None,
             messages=messages,
-            other_content={
-                "finish_message": finish_message,
-                "useful_trajectory_indexes": useful_trajectory_indexes,
-            },
+            other_content=other_content,
         )
+
+    # ====================================================================
+    # selective 模式：补索 useful_trajectory_indexes
+    # ====================================================================
+
+    @staticmethod
+    def _is_selective_mode(messages: list[dict]) -> bool:
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = str(msg.get("content", ""))
+                if "TRAJECTORY INDEXING" in content or "useful_trajectory_indexes" in content:
+                    return True
+        return False
+
+    def _prompt_for_useful_indexes(
+        self,
+        messages: list[dict],
+        out_dir: str,
+        trajectory: list[dict],
+    ) -> list[int]:
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            logger.info(
+                f"[CodeAgentOptimized] Prompting for useful_trajectory_indexes "
+                f"(attempt {attempt}/{max_attempts})"
+            )
+            prompt_msg = {
+                "role": "user",
+                "content": (
+                    "You called `finish` but did NOT provide `useful_trajectory_indexes`. "
+                    "This is REQUIRED in selective mode.\n\n"
+                    "Please reply with ONLY a JSON array of step indexes that the next operator MUST see. "
+                    "Example: [0, 2, 5]\n\n"
+                    "Your step indexes:\n"
+                    + "\n".join(
+                        f"- Step {rec.get('index', '?')}: {rec.get('tool_name', rec.get('role', '?'))} — "
+                        f"{(rec.get('observation', '') or rec.get('thinking', ''))[:80]}"
+                        for rec in trajectory
+                        if rec.get("role") in ("tool", "assistant") and rec.get("index", -1) >= 0
+                    )
+                ),
+            }
+            messages.append(prompt_msg)
+
+            response_msg = self._call_llm(messages)
+            content = response_msg.content or ""
+            messages.append({"role": "assistant", "content": content})
+
+            parsed = self._parse_useful_indexes_from_text(content)
+            if parsed:
+                logger.info(
+                    f"[CodeAgentOptimized] Got useful_trajectory_indexes: {parsed} "
+                    f"(attempt {attempt})"
+                )
+                self._save_snapshot(out_dir, -1, messages, trajectory)
+                return parsed
+
+            logger.warning(
+                f"[CodeAgentOptimized] Failed to parse useful_indexes from response "
+                f"(attempt {attempt}): {content[:200]}"
+            )
+
+        logger.warning(
+            f"[CodeAgentOptimized] Could not get useful_trajectory_indexes "
+            f"after {max_attempts} attempts"
+        )
+        return []
+
+    @staticmethod
+    def _parse_useful_indexes_from_text(text: str) -> list[int]:
+        import re
+        matches = re.findall(r'\[(\s*\d+\s*(?:,\s*\d+\s*)*)\]', text)
+        for match in matches:
+            try:
+                indexes = [int(x.strip()) for x in match.split(",") if x.strip()]
+                if indexes:
+                    return sorted(set(indexes))
+            except ValueError:
+                continue
+        json_match = re.search(r'\[[\d\s,]+\]', text)
+        if json_match:
+            try:
+                indexes = [int(x.strip()) for x in json_match.group()[1:-1].split(",") if x.strip()]
+                if indexes:
+                    return sorted(set(indexes))
+            except ValueError:
+                pass
+        return []
 
     # ====================================================================
     # prompt 构造
@@ -606,14 +726,17 @@ class CodeAgentOptimized:
         initial_messages: list[dict] | None,
     ) -> list[dict]:
         if initial_messages:
-            messages = list(initial_messages)
-            messages.append({"role": "user", "content": instruction})
-        else:
-            messages = [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": instruction},
-            ]
-        return messages
+            return list(initial_messages)
+
+        effective_instruction = instruction
+        if self.include_steps:
+            steps = render_j2("code_agent_steps.j2")
+            effective_instruction = instruction + "\n\n" + steps
+
+        return [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": effective_instruction},
+        ]
 
     # ====================================================================
     # 工具调度
@@ -638,17 +761,29 @@ class CodeAgentOptimized:
             if tool_name == "undo_edit":
                 return self._exec_undo_edit(args, workspace)
             return f"Error: Unknown tool '{tool_name}'"
+        except TimeoutError as e:
+            return f"Error: {e}"
         except Exception as e:
             return f"Error executing {tool_name}: {e}"
 
     # --- bash -----------------------------------------------------------
+
+    @staticmethod
+    def _run_cmd(workspace: DockerWorkspace, cmd: str, timeout: float = TOOL_TIMEOUT_SECONDS):
+        r = workspace.execute_command(cmd, timeout=timeout)
+        if r.timeout_occurred:
+            raise TimeoutError(f"Command timed out after {timeout}s")
+        return r
 
     def _exec_bash(self, args: dict, workspace: DockerWorkspace) -> str:
         command = args.get("command", "")
         if not command:
             return "Error: empty command"
         timeout = float(args.get("timeout", 120))
-        result = workspace.execute_command(command, timeout=timeout)
+        try:
+            result = self._run_cmd(workspace, command, timeout=timeout)
+        except TimeoutError:
+            return f"Error: Command timed out after {timeout}s. Try a shorter command or increase the timeout parameter."
 
         parts = []
         if result.stdout:
@@ -679,13 +814,12 @@ class CodeAgentOptimized:
     def _search_filename(
         self, pattern: str, path: str, workspace: DockerWorkspace
     ) -> str:
-        r = workspace.execute_command(f"test -d {_sq(path)} && echo DIR || echo NO")
+        r = self._run_cmd(workspace, f"test -d {_sq(path)} && echo DIR || echo NO")
         if "DIR" not in (r.stdout or ""):
             return f"Error: directory not found: {path}"
 
-        r = workspace.execute_command(
+        r = self._run_cmd(workspace,
             f"find {_sq(path)} -type f -name {_sq(pattern)} 2>/dev/null",
-            timeout=60,
         )
         raw = (r.stdout or "").strip()
         if not raw:
@@ -697,9 +831,8 @@ class CodeAgentOptimized:
 
         modified_dirs: set[str] = set()
         try:
-            gr = workspace.execute_command(
+            gr = self._run_cmd(workspace,
                 f"cd {_sq(path)} && git diff --name-only HEAD 2>/dev/null",
-                timeout=30,
             )
             if gr.exit_code == 0 and gr.stdout:
                 for mf in gr.stdout.strip().splitlines():
@@ -770,7 +903,7 @@ class CodeAgentOptimized:
             return "Error: empty path"
 
         # 判断文件还是文件夹
-        r = workspace.execute_command(
+        r = self._run_cmd(workspace,
             f"test -d {_sq(path)} && echo DIR || "
             f"(test -f {_sq(path)} && echo FILE || echo MISSING)"
         )
@@ -788,7 +921,7 @@ class CodeAgentOptimized:
         else:
             cmd = f"grep -In -F --binary-files=without-match -- {_sq(keyword)} {_sq(path)}"
 
-        r = workspace.execute_command(cmd, timeout=120)
+        r = self._run_cmd(workspace, cmd)
         stdout = r.stdout or ""
         # exit code 1 => no match; 其他 => 异常
         if not stdout.strip():
@@ -860,7 +993,7 @@ class CodeAgentOptimized:
                 "Do NOT call view_file without the `path` parameter."
             )
 
-        r = workspace.execute_command(f"cat {_sq(path)}")
+        r = self._run_cmd(workspace, f"cat {_sq(path)}")
         if r.exit_code != 0:
             return f"Error reading {path}: {r.stderr or r.stdout}"
         lines = (r.stdout or "").splitlines()
@@ -919,9 +1052,9 @@ class CodeAgentOptimized:
                     f"with a non-empty old_string to edit it."
                 )
             self._push_undo(path, None)
-            workspace.execute_command(f"mkdir -p $(dirname {_sq(path)})")
+            self._run_cmd(workspace, f"mkdir -p $(dirname {_sq(path)})")
             encoded = _b64.b64encode(new_string.encode()).decode()
-            r = workspace.execute_command(
+            r = self._run_cmd(workspace,
                 f"echo '{encoded}' | base64 -d > {_sq(path)}"
             )
             if r.exit_code != 0:
@@ -929,7 +1062,7 @@ class CodeAgentOptimized:
                 return f"Error creating {path}: {r.stderr or r.stdout}"
             return f"File created: {path} ({len(new_string)} chars)."
 
-        r = workspace.execute_command(f"cat {_sq(path)}")
+        r = self._run_cmd(workspace, f"cat {_sq(path)}")
         if r.exit_code != 0:
             return f"Error reading {path}: {r.stderr or r.stdout}"
         content = r.stdout or ""
@@ -1054,12 +1187,12 @@ class CodeAgentOptimized:
         self, path: str, workspace: DockerWorkspace
     ) -> str | None:
         """读取文件内容；若不存在返回 None。"""
-        check = workspace.execute_command(
+        check = self._run_cmd(workspace,
             f"test -f {_sq(path)} && echo YES || echo NO"
         )
         if "YES" not in (check.stdout or ""):
             return None
-        r = workspace.execute_command(f"cat {_sq(path)}")
+        r = self._run_cmd(workspace, f"cat {_sq(path)}")
         if r.exit_code != 0:
             raise RuntimeError(f"Read failed: {r.stderr or r.stdout}")
         return r.stdout or ""
@@ -1079,9 +1212,9 @@ class CodeAgentOptimized:
         if record_undo:
             prev = self._read_file_or_none(path, workspace)
             self._push_undo(path, prev)
-        workspace.execute_command(f"mkdir -p $(dirname {_sq(path)})")
+        self._run_cmd(workspace, f"mkdir -p $(dirname {_sq(path)})")
         encoded = _b64.b64encode(content.encode()).decode()
-        r = workspace.execute_command(f"echo '{encoded}' | base64 -d > {_sq(path)}")
+        r = self._run_cmd(workspace, f"echo '{encoded}' | base64 -d > {_sq(path)}")
         if r.exit_code != 0:
             raise RuntimeError(f"Write failed: {r.stderr or r.stdout}")
 
@@ -1102,7 +1235,7 @@ class CodeAgentOptimized:
         prev = stack.pop()
         if prev is None:
             # 之前文件不存在 -> 删除之
-            r = workspace.execute_command(f"rm -f {_sq(path)}")
+            r = self._run_cmd(workspace, f"rm -f {_sq(path)}")
             if r.exit_code != 0:
                 # 失败则恢复栈
                 stack.append(prev)
@@ -1110,7 +1243,7 @@ class CodeAgentOptimized:
             return f"Undo: removed {path} (it did not exist before the edit)."
         # 之前有内容 -> 还原
         encoded = _b64.b64encode(prev.encode()).decode()
-        r = workspace.execute_command(
+        r = self._run_cmd(workspace,
             f"echo '{encoded}' | base64 -d > {_sq(path)}"
         )
         if r.exit_code != 0:
@@ -1142,7 +1275,7 @@ class CodeAgentOptimized:
                 checks.append(
                     f'python -c "import {mod}" 2>/dev/null || echo MISSING:{pkg}'
                 )
-            r = workspace.execute_command(" ; ".join(checks), timeout=60)
+            r = self._run_cmd(workspace, " ; ".join(checks))
             missing = []
             for line in (r.stdout or "").splitlines():
                 if line.startswith("MISSING:"):
@@ -1156,7 +1289,7 @@ class CodeAgentOptimized:
                 f"pip install --quiet --disable-pip-version-check "
                 f"--no-input {' '.join(missing)} >/dev/null 2>&1 || true"
             )
-            workspace.execute_command(cmd, timeout=600)
+            self._run_cmd(workspace, cmd, timeout=600)
         except Exception as e:
             logger.warning(f"preinstall failed (ignored): {e}")
 
@@ -1213,6 +1346,21 @@ class CodeAgentOptimized:
         except Exception as e:
             logger.warning(f"Failed to append trajectory step: {e}")
 
+    def _write_trajectory_md(
+        self,
+        out_dir: str,
+        trajectory: list[dict],
+        extra_info: dict | None = None,
+    ) -> None:
+        try:
+            from src.tools.funcs import render_trajectory_md
+            md_path = os.path.join(out_dir, "trajectory.md")
+            content = render_trajectory_md(trajectory, extra_info)
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            logger.warning(f"Failed to write trajectory md: {e}")
+
     def _save_snapshot(
         self,
         out_dir: str,
@@ -1229,6 +1377,12 @@ class CodeAgentOptimized:
             path = os.path.join(out_dir, "trajectory_snapshot.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+
+            self._write_trajectory_md(
+                out_dir,
+                trajectory,
+                extra_info={"current_step": step, "messages_count": len(messages)},
+            )
         except Exception as e:
             logger.warning(f"Failed to save snapshot: {e}")
 
@@ -1249,6 +1403,13 @@ class CodeAgentOptimized:
             path = os.path.join(out_dir, "agent_result.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+
+            extra = {
+                "total_steps": len(trajectory),
+                "finish_message": finish_message[:200] if finish_message else "",
+                "total_tokens": metrics.get("total_tokens", 0),
+            }
+            self._write_trajectory_md(out_dir, trajectory, extra_info=extra)
         except Exception as e:
             logger.warning(f"Failed to save final result: {e}")
 

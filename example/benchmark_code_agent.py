@@ -91,118 +91,132 @@ def run_single_instance_planning_execution(args_dict):
     pipeline_config = args_dict["pipeline_config"]
 
     instance_id = instance["instance_id"]
-    logger.info(f"[Worker-PE] Starting {instance_id}")
+    tmp_root = runner_config["tmp_root"]
+    log_dir = os.path.join(tmp_root, "log", instance_id)
+    os.makedirs(log_dir, exist_ok=True)
 
-    workspace = None
-    try:
-        runner = SweBenchRunner(**runner_config)
-        workspace = runner.prepare_workspace(instance)
+    from src.benchmarks.utils.worker_context import instance_context
 
-        repo_name = instance["repo"].split("/")[-1]
-        repo_path = f"/workspace/{repo_name}"
-        base_commit = instance["base_commit"]
-        repo_url = f"https://github.com/{instance['repo']}.git"
+    with instance_context(log_dir, instance_id):
+        logger.info(f"[Worker-PE] Starting {instance_id}")
 
-        repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
-        logger.info(f"[Worker-PE] Cloning {repo_url} @ {base_commit} into {repo_path}")
-        clone_result = workspace.execute_command(
-            f"rm -rf {repo_path} && "
-            f"git init {repo_path} && "
-            f"cd {repo_path} && "
-            f"git remote add origin {repo_url} && "
-            f"git fetch --depth 1 origin {base_commit}",
-            timeout=float(repo_prepare_timeout),
-        )
-        if clone_result.exit_code != 0:
-            raise RuntimeError(
-                f"git fetch failed for {instance_id}: {clone_result.stderr or clone_result.stdout}"
+        workspace = None
+        try:
+            runner = SweBenchRunner(**runner_config)
+            workspace = runner.prepare_workspace(instance)
+
+            repo_name = instance["repo"].split("/")[-1]
+            repo_path = f"/workspace/{repo_name}"
+            base_commit = instance["base_commit"]
+            repo_url = f"https://github.com/{instance['repo']}.git"
+
+            repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
+            logger.info(f"[Worker-PE] Cloning {repo_url} @ {base_commit} into {repo_path}")
+            clone_result = workspace.execute_command(
+                f"rm -rf {repo_path} && "
+                f"git init {repo_path} && "
+                f"cd {repo_path} && "
+                f"git remote add origin {repo_url} && "
+                f"git fetch --depth 1 origin {base_commit}",
+                timeout=float(repo_prepare_timeout),
+            )
+            if clone_result.exit_code != 0:
+                raise RuntimeError(
+                    f"git fetch failed for {instance_id}: {clone_result.stderr or clone_result.stdout}"
+                )
+
+            checkout_result = workspace.execute_command(
+                f"cd {repo_path} && git checkout --detach FETCH_HEAD",
+                timeout=120.0,
+            )
+            if checkout_result.exit_code != 0:
+                raise RuntimeError(
+                    f"git checkout failed for {instance_id}: {checkout_result.stderr or checkout_result.stdout}"
+                )
+
+            logger.info(f"[Worker-PE] Repository cloned successfully for {instance_id}")
+
+            task_description = render_j2(
+                template_name="query.j2",
+                context={
+                    "repo_path": repo_path,
+                    "problem_statement": str(instance.get("problem_statement", "")).strip(),
+                    "base_commit": instance["base_commit"],
+                },
             )
 
-        checkout_result = workspace.execute_command(
-            f"cd {repo_path} && git checkout --detach FETCH_HEAD",
-            timeout=120.0,
-        )
-        if checkout_result.exit_code != 0:
-            raise RuntimeError(
-                f"git checkout failed for {instance_id}: {checkout_result.stderr or checkout_result.stdout}"
+            from src.agent.planning_execution import PlanningExecutionPipeline
+
+            pipeline = PlanningExecutionPipeline(**pipeline_config)
+
+            pipeline_result = pipeline.run(
+                instruction=task_description,
+                workspace=workspace,
+                repo_path=repo_path,
+                output_dir=os.path.join(runner_config["tmp_root"], "log", instance_id),
             )
 
-        logger.info(f"[Worker-PE] Repository cloned successfully for {instance_id}")
+            from src.benchmarks.swebench.constants import GIT_COMMIT_MESSAGE, GIT_USER_EMAIL, GIT_USER_NAME
 
-        task_description = render_j2(
-            template_name="query.j2",
-            context={
-                "repo_path": repo_path,
-                "problem_statement": str(instance.get("problem_statement", "")).strip(),
-                "base_commit": instance["base_commit"],
-            },
-        )
+            workspace.execute_command(
+                f"cd {repo_path} && "
+                f"find . -name '*.bak' -delete && "
+                f"find . -name '*.orig' -delete && "
+                f"rm -f reproduce_issue.py test_bug.py test_simple.py test_fix.py"
+            )
 
-        from src.agent.planning_execution import PlanningExecutionPipeline
+            workspace.execute_command(f"cd {repo_path} && git add -A")
+            workspace.execute_command(
+                f"cd {repo_path} && "
+                f"git config --global user.email '{GIT_USER_EMAIL}' && "
+                f"git config --global user.name '{GIT_USER_NAME}' && "
+                f"git commit --no-verify -m '{GIT_COMMIT_MESSAGE}' || true"
+            )
 
-        pipeline = PlanningExecutionPipeline(**pipeline_config)
+            diff_result = workspace.execute_command(
+                f"cd {repo_path} && git --no-pager diff --no-color {instance['base_commit']} HEAD"
+            )
+            git_patch = diff_result.stdout if diff_result.exit_code == 0 else ""
 
-        pipeline_result = pipeline.run(
-            instruction=task_description,
-            workspace=workspace,
-            repo_path=repo_path,
-            output_dir=os.path.join(runner_config["tmp_root"], "log", instance_id),
-        )
+            from src.benchmarks.swebench.swe_eval import run_swebench_eval
 
-        from src.benchmarks.swebench.constants import GIT_COMMIT_MESSAGE, GIT_USER_EMAIL, GIT_USER_NAME
+            eval_result = run_swebench_eval(
+                instance=instance,
+                git_patch=git_patch,
+                run_id=str(uuid.uuid4())[:8],
+                tmp_dir=runner_config["tmp_root"],
+            )
 
-        workspace.execute_command(f"cd {repo_path} && git add -A")
-        workspace.execute_command(
-            f"cd {repo_path} && "
-            f"git config --global user.email '{GIT_USER_EMAIL}' && "
-            f"git config --global user.name '{GIT_USER_NAME}' && "
-            f"git commit --no-verify -m '{GIT_COMMIT_MESSAGE}' || true"
-        )
+            result = {
+                "instance_id": instance_id,
+                "git_patch": git_patch,
+                "metrics": pipeline_result.metrics,
+                "resolved": eval_result.get("resolved", False),
+                "patch_applied": eval_result.get("patch_applied", False),
+                "plan_ops": len(pipeline_result.plan.operators) if pipeline_result.plan else 0,
+            }
 
-        diff_result = workspace.execute_command(
-            f"cd {repo_path} && git --no-pager diff --no-color {instance['base_commit']} HEAD"
-        )
-        git_patch = diff_result.stdout if diff_result.exit_code == 0 else ""
+            logger.info(
+                f"[Worker-PE] Completed {instance_id}: resolved={result['resolved']}, "
+                f"plan_ops={result['plan_ops']}"
+            )
+            return result
 
-        from src.benchmarks.swebench.swe_eval import run_swebench_eval
-
-        eval_result = run_swebench_eval(
-            instance=instance,
-            git_patch=git_patch,
-            run_id=str(uuid.uuid4())[:8],
-            tmp_dir=runner_config["tmp_root"],
-        )
-
-        result = {
-            "instance_id": instance_id,
-            "git_patch": git_patch,
-            "metrics": pipeline_result.metrics,
-            "resolved": eval_result.get("resolved", False),
-            "patch_applied": eval_result.get("patch_applied", False),
-            "plan_ops": len(pipeline_result.plan.operators) if pipeline_result.plan else 0,
-        }
-
-        logger.info(
-            f"[Worker-PE] Completed {instance_id}: resolved={result['resolved']}, "
-            f"plan_ops={result['plan_ops']}"
-        )
-        return result
-
-    except Exception as e:
-        logger.error(f"[Worker-PE] Error in {instance_id}: {e}")
-        traceback.print_exc()
-        return {
-            "instance_id": instance_id,
-            "error": str(e),
-            "traceback": traceback.format_exc(),
-            "resolved": False,
-        }
-    finally:
-        if workspace is not None:
-            try:
-                workspace.cleanup()
-            except Exception as cleanup_err:
-                logger.warning(f"[Worker-PE] Cleanup failed for {instance_id}: {cleanup_err}")
+        except Exception as e:
+            logger.error(f"[Worker-PE] Error in {instance_id}: {e}")
+            traceback.print_exc()
+            return {
+                "instance_id": instance_id,
+                "error": str(e),
+                "traceback": traceback.format_exc(),
+                "resolved": False,
+            }
+        finally:
+            if workspace is not None:
+                try:
+                    workspace.cleanup()
+                except Exception as cleanup_err:
+                    logger.warning(f"[Worker-PE] Cleanup failed for {instance_id}: {cleanup_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -223,7 +237,7 @@ def main():
     parser.add_argument(
         "--use-optimized-agent",
         action="store_true",
-        help="使用执行优化版 CodeAgentOptimized（仅在未开启 --use-plan-mode 和 --use-planning-execution 时生效）",
+        help="使用执行优化版 CodeAgentOptimized（含 string_replace/view_file/search_by_keyword 等工具）",
     )
 
     # PlanningExecutionPipeline 参数
@@ -249,9 +263,20 @@ def main():
     parser.add_argument(
         "--selective-fallback-rule",
         type=str,
-        default="last_half",
+        default="all",
         choices=["all", "last_half", "last_third", "none"],
         help="Fallback rule when agent fails to provide useful_trajectory_indexes in selective mode",
+    )
+    parser.add_argument(
+        "--max-time-per-operator",
+        type=float,
+        default=None,
+        help="Max wall-clock time (seconds) per operator. None = no limit",
+    )
+    parser.add_argument(
+        "--enable-replanning",
+        action="store_true",
+        help="Enable dynamic replanning: after each operator executes, call planning agent to update remaining operators",
     )
 
     parser.add_argument("--prompt-path", type=str, default="./src/prompts/query.j2", help="Prompt模板")
@@ -272,10 +297,60 @@ def main():
         cheap_cfg = yaml.safe_load(f)
 
     if args.output_dir is None:
+        exp_name = Path(args.exp_config).stem
+        if args.use_planning_execution:
+            mode_tag = "planning_execution"
+        elif args.use_plan_mode:
+            mode_tag = "plan_mode"
+        elif args.use_optimized_agent:
+            mode_tag = "optimized_code_agent"
+        else:
+            mode_tag = "code_agent"
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-        args.output_dir = f"./_tmp/parallel_{timestamp}"
+        args.output_dir = (
+            f"./_tmp/{mode_tag}_limit{args.eval_limit}"
+            f"_{exp_name}"
+            f"_{timestamp}"
+        )
     args.output_dir = _resolve_path(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
+
+    config_snapshot_dir = os.path.join(args.output_dir, "configs")
+    os.makedirs(config_snapshot_dir, exist_ok=True)
+    import shutil
+    for cfg_path in [args.exp_config, args.cheap_config]:
+        if cfg_path and os.path.isfile(cfg_path):
+            dst = os.path.join(config_snapshot_dir, os.path.basename(cfg_path))
+            shutil.copy2(cfg_path, dst)
+    if args.llm_config:
+        llm_cfg_src = _resolve_path(args.llm_config)
+        if os.path.isfile(llm_cfg_src):
+            shutil.copy2(llm_cfg_src, os.path.join(config_snapshot_dir, os.path.basename(llm_cfg_src)))
+    run_config_record = {
+        "dataset": args.dataset,
+        "split": args.split,
+        "eval_limit": args.eval_limit,
+        "exp_config": os.path.basename(args.exp_config),
+        "cheap_config": os.path.basename(args.cheap_config),
+        "llm_config": os.path.basename(args.llm_config) if args.llm_config else os.path.basename(args.exp_config),
+        "parallel": args.parallel,
+        "use_plan_mode": args.use_plan_mode,
+        "use_optimized_agent": args.use_optimized_agent,
+        "use_planning_execution": args.use_planning_execution,
+        "use_cost_estimation": args.use_cost_estimation,
+        "num_candidate_plans": args.num_candidate_plans,
+        "max_steps_per_operator": args.max_steps_per_operator,
+        "trajectory_passing_mode": args.trajectory_passing_mode,
+        "selective_fallback_rule": args.selective_fallback_rule,
+        "max_time_per_operator": args.max_time_per_operator,
+        "enable_replanning": args.enable_replanning,
+        "http_proxy": args.http_proxy,
+        "no_proxy": args.no_proxy,
+        "output_dir": args.output_dir,
+    }
+    with open(os.path.join(config_snapshot_dir, "run_config.json"), "w", encoding="utf-8") as f:
+        json.dump(run_config_record, f, indent=2, ensure_ascii=False)
+
     main_log_path = configure_main_logger(args.output_dir)
 
     logger.info(
@@ -306,6 +381,9 @@ def main():
             "max_steps_per_operator": args.max_steps_per_operator,
             "trajectory_passing_mode": args.trajectory_passing_mode,
             "selective_fallback_rule": args.selective_fallback_rule,
+            "max_time_per_operator": args.max_time_per_operator,
+            "use_optimized_agent": args.use_optimized_agent,
+            "enable_replanning": args.enable_replanning,
         }
 
         runner = SweBenchRunner(**runner_config)

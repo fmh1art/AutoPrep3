@@ -16,6 +16,7 @@ from typing import Any, Callable
 from openhands.workspace import DockerWorkspace
 
 from src.module.gpt_inference import SimpleAPICaller
+from src.tools.funcs import render_j2
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ IMPORTANT RULES:
 """
 
 MAX_OBS_CHARS = 16000
+TOOL_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -178,10 +180,15 @@ class CodeAgent:
     def __init__(
         self,
         llm_cfg: dict,
-        max_steps: int = 100,
+        max_steps: int = 200,
         max_retries_per_call: int = 3,
         system_prompt: str | None = None,
         tool_definitions: list[dict] | None = None,
+        repo_path: str = "/workspace",
+        base_commit: str = "",
+        include_steps: bool = True,
+        max_time: float | None = None,
+        terminating_tools: list[str] | None = None,
     ):
         self.caller = SimpleAPICaller(
             llm_name=llm_cfg["llm_name"],
@@ -193,6 +200,11 @@ class CodeAgent:
         self.max_retries_per_call = max_retries_per_call
         self.system_prompt = system_prompt or SYSTEM_PROMPT
         self.tools = tool_definitions or TOOL_DEFINITIONS
+        self.repo_path = repo_path
+        self.base_commit = base_commit
+        self.include_steps = include_steps
+        self.max_time = max_time
+        self.terminating_tools = set(terminating_tools or [])
 
     def run(
         self,
@@ -201,6 +213,7 @@ class CodeAgent:
         callbacks: list[Callable] | None = None,
         output_dir: str | None = None,
         initial_messages: list[dict] | None = None,
+        prefix_trajectory: list[dict] | None = None,
     ) -> AgentResult:
         """
         运行 Agent 完成一次对话。
@@ -222,19 +235,46 @@ class CodeAgent:
 
         if initial_messages:
             messages: list[dict] = list(initial_messages)
-            messages.append({"role": "user", "content": instruction})
         else:
+            effective_instruction = instruction
+            if self.include_steps:
+                steps = render_j2("code_agent_steps.j2")
+                effective_instruction = instruction + "\n\n" + steps
             messages: list[dict] = [
                 {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": instruction},
+                {"role": "user", "content": effective_instruction},
             ]
 
         trajectory: list[dict] = []
+
+        if prefix_trajectory:
+            for rec in prefix_trajectory:
+                trajectory.append(rec)
+
+        init_record = {
+            "index": -1,
+            "role": "initial_prompt",
+            "messages": messages,
+            "timestamp": time.time(),
+        }
+        trajectory.append(init_record)
+        self._write_trajectory_md(out_dir, trajectory)
+
         usage_before = self.caller.get_total_usage()
         finish_message = ""
         useful_trajectory_indexes: list[int] = []
+        start_time = time.time()
 
         for step in range(self.max_steps):
+            if self.max_time is not None:
+                elapsed = time.time() - start_time
+                if elapsed > self.max_time:
+                    logger.warning(
+                        f"[CodeAgent] Timeout after {elapsed:.1f}s "
+                        f"(max_time={self.max_time}s) at step {step}"
+                    )
+                    break
+
             logger.info(f"[CodeAgent] Step {step}")
 
             response_msg = self._call_llm(messages)
@@ -252,6 +292,7 @@ class CodeAgent:
             messages.append(assistant_msg)
 
             thinking = response_msg.content or ""
+            reasoning_content = getattr(response_msg, "reasoning_content", None) or ""
             tool_calls = response_msg.tool_calls or []
 
             if not tool_calls:
@@ -259,6 +300,7 @@ class CodeAgent:
                     "index": step,
                     "role": "assistant",
                     "thinking": thinking,
+                    "reasoning": reasoning_content,
                     "usage": step_usage,
                     "timestamp": time.time(),
                 }
@@ -277,6 +319,8 @@ class CodeAgent:
                 continue
 
             finished = False
+            terminated_tool_name: str | None = None
+            terminated_tool_args: dict = {}
             for tc in tool_calls:
                 tool_name = tc.function.name
                 try:
@@ -293,6 +337,11 @@ class CodeAgent:
                         ]
                     observation = f"Agent finished: {finish_message}"
                     finished = True
+                elif tool_name in self.terminating_tools:
+                    terminated_tool_name = tool_name
+                    terminated_tool_args = tool_args
+                    observation = f"Agent called terminating tool: {tool_name}"
+                    finished = True
                 else:
                     observation = self._execute_tool(tool_name, tool_args, workspace)
 
@@ -303,6 +352,7 @@ class CodeAgent:
                     "tool_args": tool_args,
                     "observation": observation,
                     "thinking": thinking,
+                    "reasoning": reasoning_content,
                     "usage": step_usage,
                     "timestamp": time.time(),
                     "finish_message": finish_message if finished else None,
@@ -325,10 +375,15 @@ class CodeAgent:
             self._save_snapshot(out_dir, step, messages, trajectory)
 
             if finished:
-                logger.info(
-                    f"[CodeAgent] Finished at step {step}, "
-                    f"useful indexes: {useful_trajectory_indexes}"
-                )
+                if terminated_tool_name:
+                    logger.info(
+                        f"[CodeAgent] Terminating tool '{terminated_tool_name}' called at step {step}"
+                    )
+                else:
+                    logger.info(
+                        f"[CodeAgent] Finished at step {step}, "
+                        f"useful indexes: {useful_trajectory_indexes}"
+                    )
                 break
         else:
             logger.warning("[CodeAgent] Reached max steps without finishing")
@@ -338,14 +393,20 @@ class CodeAgent:
 
         self._save_final(out_dir, trajectory, metrics, finish_message)
 
+        other_content = {
+            "finish_message": finish_message,
+            "useful_trajectory_indexes": useful_trajectory_indexes,
+            "trajectory_records": trajectory,
+        }
+        if terminated_tool_name:
+            other_content["terminated_tool"] = terminated_tool_name
+            other_content["terminated_tool_args"] = terminated_tool_args
+
         return AgentResult(
             metrics=metrics,
             conversation=None,
             messages=messages,
-            other_content={
-                "finish_message": finish_message,
-                "useful_trajectory_indexes": useful_trajectory_indexes,
-            },
+            other_content=other_content,
         )
 
     def _call_llm(self, messages: list[dict]):
@@ -398,8 +459,17 @@ class CodeAgent:
                 return self._exec_file_editor(args, workspace)
             else:
                 return f"Error: Unknown tool '{tool_name}'"
+        except TimeoutError as e:
+            return f"Error: {e}"
         except Exception as e:
             return f"Error executing {tool_name}: {e}"
+
+    @staticmethod
+    def _run_cmd(workspace: DockerWorkspace, cmd: str, timeout: float = TOOL_TIMEOUT_SECONDS):
+        r = workspace.execute_command(cmd, timeout=timeout)
+        if r.timeout_occurred:
+            raise TimeoutError(f"Command timed out after {timeout}s")
+        return r
 
     def _exec_bash(self, args: dict, workspace: DockerWorkspace) -> str:
         command = args.get("command", "")
@@ -407,7 +477,10 @@ class CodeAgent:
             return "Error: empty command"
 
         timeout = float(args.get("timeout", 120))
-        result = workspace.execute_command(command, timeout=timeout)
+        try:
+            result = self._run_cmd(workspace, command, timeout=timeout)
+        except TimeoutError:
+            return f"Error: Command timed out after {timeout}s. Try a shorter command or increase the timeout parameter."
 
         output_parts = []
         if result.stdout:
@@ -451,10 +524,10 @@ class CodeAgent:
     def _fe_view(
         self, path: str, view_range: list[int] | None, workspace: DockerWorkspace
     ) -> str:
-        check = workspace.execute_command(f"test -d {_sq(path)} && echo DIR || echo FILE")
+        check = self._run_cmd(workspace, f"test -d {_sq(path)} && echo DIR || echo FILE")
         is_dir = "DIR" in (check.stdout or "")
         if is_dir:
-            r = workspace.execute_command(
+            r = self._run_cmd(workspace,
                 f"find {_sq(path)} -maxdepth 2 -not -path '*/\\.*' | head -200"
             )
             return r.stdout or "(empty directory)"
@@ -462,11 +535,11 @@ class CodeAgent:
         if view_range:
             start, end = view_range[0], view_range[-1]
             if end == -1:
-                r = workspace.execute_command(f"cat -n {_sq(path)} | tail -n +{start}")
+                r = self._run_cmd(workspace, f"cat -n {_sq(path)} | tail -n +{start}")
             else:
-                r = workspace.execute_command(f"cat -n {_sq(path)} | sed -n '{start},{end}p'")
+                r = self._run_cmd(workspace, f"cat -n {_sq(path)} | sed -n '{start},{end}p'")
         else:
-            r = workspace.execute_command(f"cat -n {_sq(path)}")
+            r = self._run_cmd(workspace, f"cat -n {_sq(path)}")
 
         if r.exit_code != 0:
             return f"Error viewing {path}: {r.stderr or r.stdout}"
@@ -477,16 +550,16 @@ class CodeAgent:
         return output
 
     def _fe_create(self, path: str, file_text: str, workspace: DockerWorkspace) -> str:
-        check = workspace.execute_command(f"test -f {_sq(path)} && echo EXISTS")
+        check = self._run_cmd(workspace, f"test -f {_sq(path)} && echo EXISTS")
         if "EXISTS" in (check.stdout or ""):
             return f"Error: file {path} already exists. Use str_replace to edit."
 
-        workspace.execute_command(f"mkdir -p $(dirname {_sq(path)})")
+        self._run_cmd(workspace, f"mkdir -p $(dirname {_sq(path)})")
 
         import base64 as _b64
 
         encoded = _b64.b64encode(file_text.encode()).decode()
-        r = workspace.execute_command(f"echo '{encoded}' | base64 -d > {_sq(path)}")
+        r = self._run_cmd(workspace, f"echo '{encoded}' | base64 -d > {_sq(path)}")
         if r.exit_code != 0:
             return f"Error creating {path}: {r.stderr}"
         return f"File created: {path}"
@@ -494,7 +567,7 @@ class CodeAgent:
     def _fe_str_replace(
         self, path: str, old_str: str, new_str: str, workspace: DockerWorkspace
     ) -> str:
-        r = workspace.execute_command(f"cat {_sq(path)}")
+        r = self._run_cmd(workspace, f"cat {_sq(path)}")
         if r.exit_code != 0:
             return f"Error reading {path}: {r.stderr}"
 
@@ -505,13 +578,13 @@ class CodeAgent:
         if count > 1:
             return f"Error: old_str found {count} times in {path}. Make it more specific."
 
-        workspace.execute_command(f"cp {_sq(path)} {_sq(path + '.bak')}")
+        self._run_cmd(workspace, f"cp {_sq(path)} {_sq(path + '.bak')}")
 
         new_content = content.replace(old_str, new_str, 1)
         import base64 as _b64
 
         encoded = _b64.b64encode(new_content.encode()).decode()
-        r = workspace.execute_command(f"echo '{encoded}' | base64 -d > {_sq(path)}")
+        r = self._run_cmd(workspace, f"echo '{encoded}' | base64 -d > {_sq(path)}")
         if r.exit_code != 0:
             return f"Error writing {path}: {r.stderr}"
 
@@ -525,9 +598,9 @@ class CodeAgent:
     def _fe_insert(
         self, path: str, insert_line: int, new_str: str, workspace: DockerWorkspace
     ) -> str:
-        workspace.execute_command(f"cp {_sq(path)} {_sq(path + '.bak')}")
+        self._run_cmd(workspace, f"cp {_sq(path)} {_sq(path + '.bak')}")
 
-        r = workspace.execute_command(f"cat {_sq(path)}")
+        r = self._run_cmd(workspace, f"cat {_sq(path)}")
         if r.exit_code != 0:
             return f"Error reading {path}: {r.stderr}"
 
@@ -542,19 +615,34 @@ class CodeAgent:
 
         new_content = "".join(lines)
         encoded = _b64.b64encode(new_content.encode()).decode()
-        r = workspace.execute_command(f"echo '{encoded}' | base64 -d > {_sq(path)}")
+        r = self._run_cmd(workspace, f"echo '{encoded}' | base64 -d > {_sq(path)}")
         if r.exit_code != 0:
             return f"Error writing {path}: {r.stderr}"
         return f"Inserted {len(new_lines)} line(s) after line {insert_line} in {path}."
 
     def _fe_undo(self, path: str, workspace: DockerWorkspace) -> str:
-        check = workspace.execute_command(f"test -f {_sq(path + '.bak')} && echo YES")
+        check = self._run_cmd(workspace, f"test -f {_sq(path + '.bak')} && echo YES")
         if "YES" not in (check.stdout or ""):
             return f"Error: no backup found for {path}"
-        r = workspace.execute_command(f"mv {_sq(path + '.bak')} {_sq(path)}")
+        r = self._run_cmd(workspace, f"mv {_sq(path + '.bak')} {_sq(path)}")
         if r.exit_code != 0:
             return f"Error restoring {path}: {r.stderr}"
         return f"Undo successful for {path}."
+
+    def _write_trajectory_md(
+        self,
+        out_dir: str,
+        trajectory: list[dict],
+        extra_info: dict | None = None,
+    ) -> None:
+        try:
+            from src.tools.funcs import render_trajectory_md
+            md_path = os.path.join(out_dir, "trajectory.md")
+            content = render_trajectory_md(trajectory, extra_info)
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(content)
+        except Exception as e:
+            logger.warning(f"Failed to write trajectory md: {e}")
 
     def _save_snapshot(
         self, out_dir: str, step: int, messages: list[dict], trajectory: list[dict]
@@ -568,6 +656,12 @@ class CodeAgent:
             path = os.path.join(out_dir, "trajectory_snapshot.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, ensure_ascii=False, indent=2, default=str)
+
+            self._write_trajectory_md(
+                out_dir,
+                trajectory,
+                extra_info={"current_step": step, "messages_count": len(messages)},
+            )
         except Exception as e:
             logger.warning(f"Failed to save snapshot: {e}")
 
@@ -584,6 +678,13 @@ class CodeAgent:
             path = os.path.join(out_dir, "agent_result.json")
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(result, f, ensure_ascii=False, indent=2, default=str)
+
+            extra = {
+                "total_steps": len(trajectory),
+                "finish_message": finish_message[:200] if finish_message else "",
+                "total_tokens": metrics.get("total_tokens", 0),
+            }
+            self._write_trajectory_md(out_dir, trajectory, extra_info=extra)
         except Exception as e:
             logger.warning(f"Failed to save final result: {e}")
 

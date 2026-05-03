@@ -1,0 +1,38 @@
+Decompose the task into operators in sequence with dependency information. Each operator is executed by an autonomous coding agent with full tool access (search, read, edit, bash).
+
+SWE cases are typically addressed by the downstream steps in general:
+
+1. Analyze the codebase by finding and reading relevant files
+2. Create a reproduction script to reproduce the issue
+3. Edit the source code to resolve the issue
+4. Verify your fix works by running your reproduction script again
+5. Test edge cases to ensure your fix is robust
+
+You can refer to the steps above for guidance when generating the plan of given SWE cases. But some steps can be ignored if not necessary.
+
+## Dependency Specification
+
+For each operator, you must specify its **dependencies** on ALL previous operators. A dependency is a floating-point score from 0.0 to 1.0.
+
+Notice that the dependency relationships are not transitive, so you should specify all dependencies explicitly. For example, for operator k, you should specify its dependencies with operator 1,2,...,k-1.
+
+## Output Format
+
+Output ONLY a JSON array where each element has `index`, `subtask`, and `dependencies`:
+
+```json
+[
+  {"index": 1, "subtask": <subtask_here></subtask_here>, "dependencies": {}},
+  {"index": 2, "subtask": <subtask_here>, "dependencies": {"1": 0.9}},
+  {"index": 3, "subtask": <subtask_here>, "dependencies": {"1": 0.6, "2": 0.4}},
+  ...
+]
+```
+
+## Task
+{{ instruction }}
+
+{% if workspace_overview %}
+## Workspace
+{{ workspace_overview }}
+{% endif %}
