@@ -1,8 +1,13 @@
 llm_name: ep-20250612104210-ss27q
 key: 02002c34-ca56-4797-a742-87fd6ec3981c
 openai_base_url: https://ark-cn-beijing.bytedance.net/api/v3
+cache_server_url: http://127.0.0.1:18731
 
-price_dollar_per_token:
-  input_token: 0.00000053
-  output_token: 0.00000339
-  cached_token: 0.00000011
+price_yuan_per_million_token:
+  input_token: 0.53
+  output_token: 3.39
+  cached_token: 0.11
+
+token_ratio:
+  k: 1.01
+  b: 50.21

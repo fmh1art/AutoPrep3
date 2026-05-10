@@ -41,8 +41,8 @@ The next operator will receive ONLY the steps you mark as useful. Your goal is t
 
 **INCLUDE steps that contain:**
 1. The step that revealed the bug location — the exact file path, function name, and line number
-2. The step that showed the current code at the bug location — the `view` or `cat` command that displayed the code
-3. The step that made the actual code change(s) — every `str_replace` or `insert` call
+2. The step that showed the current code at the bug location — the `view_file` or `cat` command that displayed the code
+3. The step that made the actual code change(s) — every `string_replace` call
 4. The step with the test/verification result — any test run confirming the fix works
 5. The step that revealed related code — any other file/function that must also be changed
 

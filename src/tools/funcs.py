@@ -10,9 +10,14 @@ from typing import Optional, Dict, Any
 # Jinja2 渲染支持
 try:
     from jinja2 import Environment, FileSystemLoader
-except Exception:  # 允许在未安装 jinja2 的环境下被导入（仅在使用时才会失败）
-    Environment = None  # type: ignore
-    FileSystemLoader = None  # type: ignore
+except Exception:
+    Environment = None
+    FileSystemLoader = None
+
+try:
+    import tiktoken
+except Exception:
+    tiktoken = None
 
 import re
 
@@ -106,6 +111,18 @@ def save_json(a, fn):
             f2.write(b)
     except Exception as e:
         print(f"Error saving JSON: {e}")
+
+
+def cal_token(text: str, model: str = "cl100k_base") -> int:
+    if not text:
+        return 0
+    if tiktoken is not None:
+        try:
+            enc = tiktoken.get_encoding(model)
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
 
 
 # ---------------------------

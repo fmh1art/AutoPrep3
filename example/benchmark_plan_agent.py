@@ -1,5 +1,7 @@
 """
-并行运行SWE-bench评估 — Step-by-Step PlanAgent 模式
+并行运行SWE-bench评估 — COAT V0 (Step-by-Step PlanAgent) 模式
+
+COAT: Context-aware Orchestrated Agent with Tool-calling
 
 Planning Agent 通过 tool-calling 逐步创建 sub-agent：
   1. Planning Agent 调用 CreateSubagent(subtask, related_subtask_index)
@@ -50,7 +52,44 @@ def _resolve_path(value: str, fallback_base: Path | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PlanAgent worker
+# Real-time evaluation progress logging helper
+# ---------------------------------------------------------------------------
+
+def _log_eval_progress(result: dict, results_so_far: list[dict], total_instances: int) -> None:
+    """实时打印单实例评估结果 + 当前累计 resolved rate。
+
+    格式示例：
+        [Eval  3/64] django__django-12345 → RESOLVED=True  | running 2/3 (66.7%) | errors=0 | tokens=45,123
+    """
+    instance_id = result.get("instance_id", "?")
+    has_error = bool(result.get("error"))
+    resolved = bool(result.get("resolved", False))
+
+    done = len(results_so_far)
+    resolved_count = sum(1 for r in results_so_far if r.get("resolved", False))
+    error_count = sum(1 for r in results_so_far if r.get("error"))
+    rate = (resolved_count / done * 100) if done > 0 else 0.0
+
+    metrics = result.get("metrics", {}) or {}
+    total_metrics = metrics.get("total", {}) if isinstance(metrics, dict) else {}
+    total_tokens = total_metrics.get("total_tokens") if isinstance(total_metrics, dict) else None
+
+    status = "ERROR " if has_error else ("RESOLVED=True " if resolved else "RESOLVED=False")
+    parts = [
+        f"[Eval {done:>3}/{total_instances}] {instance_id} → {status}",
+        f"running {resolved_count}/{done} ({rate:.1f}%)",
+        f"errors={error_count}",
+    ]
+    if total_tokens:
+        parts.append(f"tokens={total_tokens:,}")
+    if has_error:
+        err_preview = str(result.get("error", ""))[:120]
+        parts.append(f"err={err_preview!r}")
+    logger.info(" | ".join(parts))
+
+
+# ---------------------------------------------------------------------------
+# COAT V0 PlanAgent worker
 # ---------------------------------------------------------------------------
 
 def run_single_instance_plan_agent(args_dict):
@@ -66,7 +105,7 @@ def run_single_instance_plan_agent(args_dict):
     from src.benchmarks.utils.worker_context import instance_context
 
     with instance_context(log_dir, instance_id):
-        logger.info(f"[Worker-PlanAgent] Starting {instance_id}")
+        logger.info(f"[Worker-COAT-V0] Starting {instance_id}")
 
         workspace = None
         try:
@@ -79,7 +118,7 @@ def run_single_instance_plan_agent(args_dict):
             repo_url = f"https://github.com/{instance['repo']}.git"
 
             repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
-            logger.info(f"[Worker-PlanAgent] Cloning {repo_url} @ {base_commit} into {repo_path}")
+            logger.info(f"[Worker-COAT-V0] Cloning {repo_url} @ {base_commit} into {repo_path}")
             clone_result = workspace.execute_command(
                 f"rm -rf {repo_path} && "
                 f"git init {repo_path} && "
@@ -102,7 +141,7 @@ def run_single_instance_plan_agent(args_dict):
                     f"git checkout failed for {instance_id}: {checkout_result.stderr or checkout_result.stdout}"
                 )
 
-            logger.info(f"[Worker-PlanAgent] Repository cloned successfully for {instance_id}")
+            logger.info(f"[Worker-COAT-V0] Repository cloned successfully for {instance_id}")
 
             task_description = str(instance.get("problem_statement", "")).strip()
 
@@ -155,17 +194,16 @@ def run_single_instance_plan_agent(args_dict):
                 "resolved": eval_result.get("resolved", False),
                 "patch_applied": eval_result.get("patch_applied", False),
                 "subtask_count": len(pipeline_result.subtask_results),
-                "terminate_summary": pipeline_result.terminate_summary[:200] if pipeline_result.terminate_summary else "",
             }
 
             logger.info(
-                f"[Worker-PlanAgent] Completed {instance_id}: resolved={result['resolved']}, "
+                f"[Worker-COAT-V0] Completed {instance_id}: resolved={result['resolved']}, "
                 f"subtasks={result['subtask_count']}"
             )
             return result
 
         except Exception as e:
-            logger.error(f"[Worker-PlanAgent] Error in {instance_id}: {e}")
+            logger.error(f"[Worker-COAT-V0] Error in {instance_id}: {e}")
             traceback.print_exc()
             return {
                 "instance_id": instance_id,
@@ -178,7 +216,7 @@ def run_single_instance_plan_agent(args_dict):
                 try:
                     workspace.cleanup()
                 except Exception as cleanup_err:
-                    logger.warning(f"[Worker-PlanAgent] Cleanup failed for {instance_id}: {cleanup_err}")
+                    logger.warning(f"[Worker-COAT-V0] Cleanup failed for {instance_id}: {cleanup_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +225,7 @@ def run_single_instance_plan_agent(args_dict):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="并行运行SWE-bench评估 — Step-by-Step PlanAgent 模式"
+        description="并行运行SWE-bench评估 — COAT V0 (Step-by-Step PlanAgent) 模式"
     )
     parser.add_argument("--dataset", type=str, required=True, help="数据集路径")
     parser.add_argument("--split", type=str, default="test", help="数据集split")
@@ -249,7 +287,7 @@ def main():
         exp_name = Path(args.exp_config).stem
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
         args.output_dir = (
-            f"./_tmp/plan_agent_limit{args.eval_limit}"
+            f"./_tmp/coat_v0_limit{args.eval_limit}"
             f"_{exp_name}"
             # f"_sub{args.max_steps_per_subagent}"
             # f"_plan{args.max_planning_steps}"
@@ -346,6 +384,7 @@ def main():
         for task in tasks:
             result = run_single_instance_plan_agent(task)
             results.append(result)
+            _log_eval_progress(result, results, len(instances))
     else:
         worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))
         with ProcessPoolExecutor(max_workers=args.parallel) as executor:
@@ -365,6 +404,7 @@ def main():
                     logger.error(f"Future failed for {instance_id}: {e}")
                     result = {"instance_id": instance_id, "error": str(e), "resolved": False}
                 results.append(result)
+                _log_eval_progress(result, results, len(instances))
 
     output_file = os.path.join(args.output_dir, "results.json")
     with open(output_file, "w") as f:
@@ -387,7 +427,7 @@ if __name__ == "__main__":
 
 """
 # ============================================================
-# Step-by-Step PlanAgent — doubao
+# COAT V0 — doubao
 # ============================================================
 python example/benchmark_plan_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
@@ -421,7 +461,7 @@ python example/benchmark_plan_agent.py \
   --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 
 # ============================================================
-# Step-by-Step PlanAgent — glm5.1
+# COAT V0 — glm5.1
 # ============================================================
 python example/benchmark_plan_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \

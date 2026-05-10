@@ -1,13 +1,17 @@
-from src.module.gpt_inference import SimpleAPICaller
-import yaml
+from openhands.sdk import LLM, Agent, Conversation
 
-cfg = yaml.safe_load(open('_config/gpt-5.4-pro.yaml'))
-gpt = SimpleAPICaller(
-    llm_name=cfg['llm_name'], 
-    api_key=cfg['key'], 
-    base_url=cfg['openai_base_url'], 
-    api_version=cfg.get('api_version', None)
+llm = LLM(
+    model="kimi-k2.6",
+    api_key="sk-t7iwfuuGv42FbRhkOaSLjczH8VN9BpnhD62qHpcstzdDNS5r",
+    base_url="https://api.moonshot.cn/v1",
 )
-result = gpt.chat('hello')
 
-print(result)
+agent = Agent(
+    llm=llm,
+)
+conversation = Conversation(
+    agent=agent,
+    workspace='./',
+)
+
+conversation.send_message("directly output hi!")

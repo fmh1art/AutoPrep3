@@ -1,5 +1,7 @@
 """
-PlanAgent — Step-by-Step Planning Agent 框架。
+COAT V0 — Step-by-Step Planning Agent 框架。
+
+COAT: Context-aware Orchestrated Agent with Tool-calling
 
 核心思路：
   1. Planning Agent 有三类工具：terminate、文件查看工具（view_file/search_by_keyword）、CreateSubagent
@@ -34,7 +36,7 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Tool Definitions for Planning Agent
+# COAT V0 Tools for Planning Agent
 # ---------------------------------------------------------------------------
 
 CREATE_SUBAGENT_TOOL = {
@@ -86,13 +88,8 @@ TERMINATE_TOOL = {
         ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "summary": {
-                    "type": "string",
-                    "description": "A summary of what was accomplished across all subtasks.",
-                },
-            },
-            "required": ["summary"],
+            "properties": {},
+            "required": [],
         },
     },
 }
@@ -167,7 +164,7 @@ TOOL_TIMEOUT_SECONDS = 30
 
 
 # ---------------------------------------------------------------------------
-# Data Structures
+# COAT V0 Data Structures
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -175,7 +172,6 @@ class SubtaskResult:
     index: int = 0
     subtask: str = ""
     related_subtask_index: list[int] = field(default_factory=list)
-    finish_message: str = ""
     useful_trajectory_indexes: list[int] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
     trajectory_records: list[dict] = field(default_factory=list)
@@ -190,14 +186,13 @@ class SubtaskResult:
 @dataclass
 class PlanAgentResult:
     subtask_results: list[SubtaskResult] = field(default_factory=list)
-    terminate_summary: str = ""
     total_metrics: dict[str, Any] = field(default_factory=dict)
     planning_metrics: dict[str, Any] = field(default_factory=dict)
     other_content: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# Trajectory Filtering Helpers
+# COAT V0 Trajectory Filtering Helpers
 # ---------------------------------------------------------------------------
 
 def _filter_trajectory_records(
@@ -234,7 +229,7 @@ def _filter_trajectory_records(
 
 
 # ---------------------------------------------------------------------------
-# SubAgent Trajectory Serialization
+# COAT V0 SubAgent Trajectory Serialization
 # ---------------------------------------------------------------------------
 
 def _serialize_subagent_trajectory(result: SubtaskResult) -> str:
@@ -251,9 +246,12 @@ def _serialize_subagent_trajectory(result: SubtaskResult) -> str:
     if not records:
         parts.append("(No trajectory steps recorded)")
     else:
+        useful_set = set(result.useful_trajectory_indexes) if result.useful_trajectory_indexes else None
+
         step_records = [
             rec for rec in records
             if rec.get("role") in ("tool", "assistant") and rec.get("index", -1) >= 0
+            and (useful_set is None or rec.get("index", -1) in useful_set)
         ]
         step_records.sort(key=lambda r: r.get("index", 0))
 
@@ -263,11 +261,23 @@ def _serialize_subagent_trajectory(result: SubtaskResult) -> str:
 
             if role == "tool":
                 tool_name = rec.get("tool_name", "?")
+                tool_args = rec.get("tool_args", {})
                 observation = rec.get("observation", "")
-                if len(observation) > 1500:
-                    observation = observation[:1500] + "\n... (truncated)"
+                if len(observation) > 4000:
+                    observation = observation[:4000] + "\n... (truncated)"
                 parts.append(f"Step {idx}:")
                 parts.append(f"Tool: {tool_name}")
+                if tool_args:
+                    if tool_name == "bash" and tool_args.get("command"):
+                        cmd = tool_args["command"]
+                        if len(cmd) > 500:
+                            cmd = cmd[:500] + "..."
+                        parts.append(f"Command: {cmd}")
+                    else:
+                        args_str = json.dumps(tool_args, ensure_ascii=False)
+                        if len(args_str) > 500:
+                            args_str = args_str[:500] + "..."
+                        parts.append(f"Args: {args_str}")
                 parts.append(f"Observation:\n{observation}")
                 parts.append("")
 
@@ -282,16 +292,20 @@ def _serialize_subagent_trajectory(result: SubtaskResult) -> str:
                     parts.append(f"Thinking: {content}")
                     parts.append("")
 
+        if useful_set is not None:
+            total_steps = len([r for r in records if r.get("role") in ("tool", "assistant") and r.get("index", -1) >= 0])
+            included_steps = len(step_records)
+            if included_steps < total_steps:
+                parts.append(f"(Showing {included_steps} of {total_steps} steps — filtered by useful_trajectory_indexes)")
+
     parts.append("")
     if result.completed_normally:
         parts.append(
-            f"The sub-agent completed normally by calling `finish`. "
-            f"Finish message: {result.finish_message}"
+            "The sub-agent completed normally by calling `finish`."
         )
     else:
         parts.append(
-            f"The sub-agent was abnormally terminated (exceeded maximum steps). "
-            f"Last message: {result.finish_message or 'N/A'}"
+            "The sub-agent was abnormally terminated (exceeded maximum steps)."
         )
 
     if result.files_modified:
@@ -304,7 +318,7 @@ def _serialize_subagent_trajectory(result: SubtaskResult) -> str:
 
 
 # ---------------------------------------------------------------------------
-# File Tool Execution Helpers
+# COAT V0 File Tool Execution Helpers
 # ---------------------------------------------------------------------------
 
 def _sq(s: str) -> str:
@@ -438,7 +452,7 @@ def _exec_search_by_keyword(args: dict, workspace: "DockerWorkspace") -> str:
 
 
 # ---------------------------------------------------------------------------
-# SubAgent — wraps CodeAgentOptimized
+# COAT V0 SubAgent — wraps CodeAgentOptimized
 # ---------------------------------------------------------------------------
 
 class SubAgent:
@@ -499,7 +513,7 @@ class SubAgent:
                 prefix_trajectory.extend(rt["filtered_records"])
 
         logger.info(
-            f"[SubAgent] Running subtask: {subtask_description[:100]} | "
+            f"[COAT V0 SubAgent] Running subtask: {subtask_description[:100]} | "
             f"related={len(related_trajectories)} | "
             f"prefix_trajectory={len(prefix_trajectory)}"
         )
@@ -515,12 +529,11 @@ class SubAgent:
             )
 
             other = result.other_content or {}
-            finish_message = other.get("finish_message", "")
             useful_indexes = other.get("useful_trajectory_indexes", [])
             trajectory_records = other.get("trajectory_records", [])
             terminated_tool = other.get("terminated_tool", "")
 
-            completed_normally = terminated_tool == "finish" or bool(finish_message)
+            completed_normally = terminated_tool == "finish"
 
             if not useful_indexes and self.selective_fallback_rule != "none":
                 total_steps = self._compute_total_steps(trajectory_records)
@@ -530,7 +543,6 @@ class SubAgent:
 
             return SubtaskResult(
                 subtask=subtask_description,
-                finish_message=finish_message,
                 useful_trajectory_indexes=useful_indexes,
                 messages=result.messages if hasattr(result, "messages") else [],
                 trajectory_records=trajectory_records,
@@ -539,7 +551,7 @@ class SubAgent:
                 hit_max_steps=hit_max_steps,
             )
         except Exception as e:
-            logger.error(f"[SubAgent] Execution failed: {e}")
+            logger.error(f"[COAT V0 SubAgent] Execution failed: {e}")
             return SubtaskResult(
                 subtask=subtask_description,
                 error=str(e),
@@ -571,7 +583,7 @@ class SubAgent:
 
 
 # ---------------------------------------------------------------------------
-# PlanAgent — the planning agent with tool-calling loop
+# COAT V0 PlanAgent — the planning agent with tool-calling loop
 # ---------------------------------------------------------------------------
 
 class PlanAgent:
@@ -583,6 +595,7 @@ class PlanAgent:
             api_key=llm_cfg.get("key", llm_cfg.get("api_key", "")),
             base_url=llm_cfg.get("openai_base_url", llm_cfg.get("base_url", None)),
             api_version=llm_cfg.get("api_version", None),
+            cache_server_url=llm_cfg.get("cache_server_url"),
         )
 
     @property
@@ -604,13 +617,13 @@ class PlanAgent:
                 )
             except Exception as e:
                 last_exc = e
-                logger.warning(f"[PlanAgent] LLM attempt {attempt} failed: {e}")
+                logger.warning(f"[COAT V0 PlanAgent] LLM attempt {attempt} failed: {e}")
                 time.sleep(min(2 ** attempt, 30))
-        raise RuntimeError(f"PlanAgent LLM call failed after 3 attempts") from last_exc
+        raise RuntimeError(f"COAT V0 PlanAgent LLM call failed after 3 attempts") from last_exc
 
 
 # ---------------------------------------------------------------------------
-# PlanAgentPipeline — orchestrates the full workflow
+# COAT V0 PlanAgentPipeline — orchestrates the full workflow
 # ---------------------------------------------------------------------------
 
 class PlanAgentPipeline:
@@ -674,11 +687,11 @@ class PlanAgentPipeline:
         logs_dir = os.path.join(out_dir, "log")
         os.makedirs(logs_dir, exist_ok=True)
 
-        logger.info("[PlanAgentPipeline] Scanning workspace...")
+        logger.info("[COAT V0 PlanAgentPipeline] Scanning workspace...")
         workspace_overview = self.scan_workspace(
             workspace=workspace, repo_path=repo_path, max_files=max_scan_files,
         )
-        logger.info(f"[PlanAgentPipeline] Workspace scan: {len(workspace_overview)} chars")
+        logger.info(f"[COAT V0 PlanAgentPipeline] Workspace scan: {len(workspace_overview)} chars")
 
         task_description = render_j2("query.j2", context={
             "problem_statement": instruction,
@@ -688,7 +701,6 @@ class PlanAgentPipeline:
         subtask_results: list[SubtaskResult] = []
         completed_subtasks: list[dict] = []
         planning_usage_before = self.plan_agent.caller.get_total_usage()
-        terminate_summary = ""
 
         messages: list[dict] = [
             {"role": "system", "content": self.plan_agent._build_system_prompt([])},
@@ -708,7 +720,7 @@ class PlanAgentPipeline:
         while total_step_count < self.max_planning_total_steps and not terminated:
             total_step_count += 1
             logger.info(
-                f"[PlanAgentPipeline] Total step {total_step_count}/{self.max_planning_total_steps}, "
+                f"[COAT V0 PlanAgentPipeline] Total step {total_step_count}/{self.max_planning_total_steps}, "
                 f"CreateSubagent used: {create_subagent_count}/{self.max_planning_steps}"
             )
 
@@ -740,15 +752,13 @@ class PlanAgentPipeline:
                     tool_args = {}
 
                 if tool_name == "terminate":
-                    terminate_summary = tool_args.get("summary", "")
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
-                        "content": f"Task terminated. Summary: {terminate_summary}",
+                        "content": "Task terminated.",
                     })
                     logger.info(
-                        f"[PlanAgentPipeline] Planning agent terminated: "
-                        f"{terminate_summary[:200]}"
+                        "[COAT V0 PlanAgentPipeline] Planning agent terminated."
                     )
                     terminated = True
                     break
@@ -772,7 +782,7 @@ class PlanAgentPipeline:
 
                     subtask_index = len(subtask_results) + 1
                     logger.info(
-                        f"[PlanAgentPipeline] Creating subtask #{subtask_index}: "
+                        f"[COAT V0 PlanAgentPipeline] Creating subtask #{subtask_index}: "
                         f"{subtask[:100]} | related={related_indices}"
                     )
 
@@ -800,7 +810,6 @@ class PlanAgentPipeline:
                     completed_subtasks.append({
                         "index": subtask_index,
                         "subtask": subtask,
-                        "finish_message": result.finish_message[:500] if result.finish_message else "(no message)",
                         "error": result.error,
                         "completed_normally": result.completed_normally,
                     })
@@ -818,9 +827,8 @@ class PlanAgentPipeline:
                     })
 
                     logger.info(
-                        f"[PlanAgentPipeline] Subtask #{subtask_index} done: "
+                        f"[COAT V0 PlanAgentPipeline] Subtask #{subtask_index} done: "
                         f"completed_normally={result.completed_normally}, "
-                        f"finish_msg_len={len(result.finish_message)}, "
                         f"useful_indexes={result.useful_trajectory_indexes}, "
                         f"tokens={result.metrics.get('total_tokens', 0)}"
                     )
@@ -853,7 +861,7 @@ class PlanAgentPipeline:
 
         if not terminated:
             logger.warning(
-                "[PlanAgentPipeline] Reached max total planning steps without terminate"
+                "[COAT V0 PlanAgentPipeline] Reached max total planning steps without terminate"
             )
 
         planning_usage_after = self.plan_agent.caller.get_total_usage()
@@ -870,14 +878,12 @@ class PlanAgentPipeline:
 
         self._write_json(os.path.join(logs_dir, "token_usage.json"), total_metrics)
         self._write_json(os.path.join(logs_dir, "results.json"), {
-            "terminate_summary": terminate_summary,
             "subtask_count": len(subtask_results),
             "subtasks": [
                 {
                     "index": r.index,
                     "subtask": r.subtask,
                     "related_subtask_index": r.related_subtask_index,
-                    "finish_message": r.finish_message[:500] if r.finish_message else "",
                     "error": r.error,
                     "completed_normally": r.completed_normally,
                     "useful_trajectory_indexes": r.useful_trajectory_indexes,
@@ -891,7 +897,6 @@ class PlanAgentPipeline:
 
         return PlanAgentResult(
             subtask_results=subtask_results,
-            terminate_summary=terminate_summary,
             total_metrics=total_metrics,
             planning_metrics=planning_metrics,
             other_content={"logs_dir": logs_dir},
@@ -908,7 +913,7 @@ class PlanAgentPipeline:
         for idx in related_indices:
             prev_result = result_map.get(idx)
             if prev_result is None:
-                logger.warning(f"[PlanAgentPipeline] Related subtask #{idx} not found, skipping")
+                logger.warning(f"[COAT V0 PlanAgentPipeline] Related subtask #{idx} not found, skipping")
                 continue
 
             filtered_text = _filter_trajectory_records(
@@ -926,7 +931,6 @@ class PlanAgentPipeline:
             trajectories.append({
                 "index": idx,
                 "subtask": prev_result.subtask,
-                "trajectory_summary": prev_result.finish_message[:500] if prev_result.finish_message else "N/A",
                 "filtered_trajectory": filtered_text,
                 "filtered_records": filtered_records,
             })
@@ -960,7 +964,7 @@ class PlanAgentPipeline:
         md_path = os.path.join(llm_log_dir, f"step_{step:03d}.md")
 
         lines: list[str] = []
-        lines.append(f"# Planning Agent LLM IO — Step {step}\n")
+        lines.append(f"# COAT V0 Planning Agent LLM IO — Step {step}\n")
         lines.append(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
 
         lines.append("---\n")
@@ -1039,7 +1043,6 @@ class PlanAgentPipeline:
             "index": result.index,
             "subtask": result.subtask,
             "related_subtask_index": result.related_subtask_index,
-            "finish_message": result.finish_message,
             "useful_trajectory_indexes": result.useful_trajectory_indexes,
             "error": result.error,
             "completed_normally": result.completed_normally,

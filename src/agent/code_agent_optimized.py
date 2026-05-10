@@ -74,6 +74,14 @@ TOOL_DEFINITIONS = [
                         "type": "string",
                         "description": "The bash command to execute.",
                     },
+                    "timeout": {
+                        "type": "number",
+                        "description": (
+                            "Optional. Maximum time limit (in seconds) for the "
+                            "command. Default is 120 seconds. Use a higher value "
+                            "for long-running commands like installation or testing."
+                        ),
+                    },
                 },
                 "required": ["command"],
             },
@@ -240,15 +248,15 @@ TOOL_DEFINITIONS = [
         "function": {
             "name": "finish",
             "description": (
-                "Call when the task is complete. Include a summary message "
-                "and the indexes of useful trajectory steps."
+                "Call when the task is complete. "
+                "Include the indexes of useful trajectory steps."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "message": {
                         "type": "string",
-                        "description": "Final summary message.",
+                        "description": "Brief summary of what was done (1-2 sentences).",
                     },
                     "useful_trajectory_indexes": {
                         "type": "array",
@@ -261,7 +269,7 @@ TOOL_DEFINITIONS = [
                         ),
                     },
                 },
-                "required": ["message"],
+                "required": [],
             },
         },
     },
@@ -326,6 +334,7 @@ class CodeAgentOptimized:
             api_key=llm_cfg["key"],
             base_url=llm_cfg.get("openai_base_url"),
             api_version=llm_cfg.get("api_version"),
+            cache_server_url=llm_cfg.get("cache_server_url"),
         )
         self.max_steps = max_steps
         self.max_retries_per_call = max_retries_per_call
@@ -393,7 +402,6 @@ class CodeAgentOptimized:
         self._append_trajectory_step(out_dir, init_record)
 
         usage_before = self.caller.get_total_usage()
-        finish_message = ""
         useful_trajectory_indexes: list[int] = []
         start_time = time.time()
 
@@ -411,6 +419,8 @@ class CodeAgentOptimized:
 
             response_msg = self._call_llm(messages)
             step_usage = self.caller.get_last_usage()
+
+            self._save_llm_io(out_dir, step, messages, response_msg)
 
             assistant_msg = self._response_to_dict(response_msg)
             if assistant_msg.get("tool_calls"):
@@ -466,13 +476,13 @@ class CodeAgentOptimized:
                     tool_args = {"_raw": tc.function.arguments}
 
                 if tool_name == "finish":
-                    finish_message = tool_args.get("message", "")
                     raw = tool_args.get("useful_trajectory_indexes")
                     if isinstance(raw, list):
                         useful_trajectory_indexes = [
                             i for i in raw if isinstance(i, int)
                         ]
-                    observation = f"Agent finished: {finish_message}"
+                    finish_message = tool_args.get("message", "")
+                    observation = finish_message if finish_message else "Agent finished."
                     finished = True
                 elif tool_name in self.terminating_tools:
                     terminated_tool_name = tool_name
@@ -546,7 +556,6 @@ class CodeAgentOptimized:
                     "reasoning": reasoning_content,
                     "usage": step_usage,
                     "timestamp": time.time(),
-                    "finish_message": finish_message if finished else None,
                 }
                 if finished:
                     record["useful_trajectory_indexes"] = useful_trajectory_indexes
@@ -610,10 +619,9 @@ class CodeAgentOptimized:
         usage_after = self.caller.get_total_usage()
         metrics = self._compute_metrics(usage_before, usage_after)
 
-        self._save_final(out_dir, trajectory, metrics, finish_message)
+        self._save_final(out_dir, trajectory, metrics)
 
         other_content = {
-            "finish_message": finish_message,
             "useful_trajectory_indexes": useful_trajectory_indexes,
             "trajectory_records": trajectory,
         }
@@ -779,7 +787,9 @@ class CodeAgentOptimized:
         command = args.get("command", "")
         if not command:
             return "Error: empty command"
-        timeout = float(args.get("timeout", 120))
+
+        timeout_val = args.get("timeout")
+        timeout = float(timeout_val) if timeout_val is not None else TOOL_TIMEOUT_SECONDS
         try:
             result = self._run_cmd(workspace, command, timeout=timeout)
         except TimeoutError:
@@ -1317,9 +1327,6 @@ class CodeAgentOptimized:
     def _response_to_dict(msg) -> dict:
         d: dict[str, Any] = {"role": "assistant"}
         d["content"] = msg.content if msg.content else None
-        reasoning_content = getattr(msg, "reasoning_content", None)
-        if reasoning_content:
-            d["reasoning_content"] = reasoning_content
         if msg.tool_calls:
             d["tool_calls"] = [
                 {
@@ -1345,6 +1352,84 @@ class CodeAgentOptimized:
                 f.write(json.dumps(record, ensure_ascii=False, default=str) + "\n")
         except Exception as e:
             logger.warning(f"Failed to append trajectory step: {e}")
+
+    def _save_llm_io(self, out_dir: str, step: int, messages: list[dict], response_msg) -> None:
+        llm_log_dir = os.path.join(out_dir, "llm_io")
+        os.makedirs(llm_log_dir, exist_ok=True)
+        md_path = os.path.join(llm_log_dir, f"step_{step:03d}.md")
+
+        lines: list[str] = []
+        lines.append(f"# Execution Agent LLM IO — Step {step}\n")
+        lines.append(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        lines.append("---\n")
+        lines.append("## Input Messages\n")
+        for i, msg in enumerate(messages):
+            role = msg.get("role", "?")
+            lines.append(f"### [{i}] {role}\n")
+
+            content = msg.get("content")
+            if content:
+                lines.append("```\n" + str(content) + "\n```\n")
+
+            reasoning = msg.get("reasoning_content")
+            if reasoning:
+                lines.append("<details><summary>Reasoning</summary>\n\n```\n" + str(reasoning) + "\n```\n\n</details>\n")
+
+            tool_calls = msg.get("tool_calls", [])
+            if tool_calls:
+                for tci, tc in enumerate(tool_calls):
+                    fn = tc.get("function", {})
+                    tc_name = fn.get("name", "?")
+                    tc_args = fn.get("arguments", "")
+                    lines.append(f"**Tool Call {tci}: `{tc_name}`**\n")
+                    try:
+                        args_parsed = json.loads(tc_args)
+                        args_display = {k: v for k, v in args_parsed.items() if k != "_trajectory_step_index"}
+                        lines.append("```json\n" + json.dumps(args_display, ensure_ascii=False, indent=2) + "\n```\n")
+                    except (json.JSONDecodeError, TypeError):
+                        lines.append("```json\n" + tc_args + "\n```\n")
+
+            tool_call_id = msg.get("tool_call_id")
+            if tool_call_id:
+                tool_content = msg.get("content", "")
+                if len(tool_content) > 3000:
+                    tool_content = tool_content[:3000] + "\n... (truncated)"
+                lines.append(f"**Tool Response (id={tool_call_id})**\n")
+                lines.append("```\n" + tool_content + "\n```\n")
+
+        lines.append("---\n")
+        lines.append("## Output Response\n")
+
+        resp_content = response_msg.content if response_msg.content else ""
+        if resp_content:
+            lines.append("### Content\n")
+            lines.append("```\n" + resp_content + "\n```\n")
+
+        resp_reasoning = getattr(response_msg, "reasoning_content", None) or ""
+        if resp_reasoning:
+            lines.append("<details><summary>Reasoning</summary>\n\n```\n" + resp_reasoning + "\n```\n\n</details>\n")
+
+        resp_tool_calls = response_msg.tool_calls or []
+        if resp_tool_calls:
+            lines.append("### Tool Calls\n")
+            for tci, tc in enumerate(resp_tool_calls):
+                fn = tc.function
+                tc_name = fn.name
+                tc_args = fn.arguments
+                lines.append(f"**{tci}. `{tc_name}`**\n")
+                try:
+                    args_parsed = json.loads(tc_args)
+                    args_display = {k: v for k, v in args_parsed.items() if k != "_trajectory_step_index"}
+                    lines.append("```json\n" + json.dumps(args_display, ensure_ascii=False, indent=2) + "\n```\n")
+                except (json.JSONDecodeError, TypeError):
+                    lines.append("```json\n" + tc_args + "\n```\n")
+
+        try:
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write("\n".join(lines))
+        except Exception as e:
+            logger.warning(f"Failed to save LLM IO for step {step}: {e}")
 
     def _write_trajectory_md(
         self,
@@ -1391,11 +1476,9 @@ class CodeAgentOptimized:
         out_dir: str,
         trajectory: list[dict],
         metrics: dict,
-        finish_message: str,
     ) -> None:
         try:
             result = {
-                "finish_message": finish_message,
                 "metrics": metrics,
                 "total_steps": len(trajectory),
                 "trajectory": trajectory,
@@ -1406,7 +1489,6 @@ class CodeAgentOptimized:
 
             extra = {
                 "total_steps": len(trajectory),
-                "finish_message": finish_message[:200] if finish_message else "",
                 "total_tokens": metrics.get("total_tokens", 0),
             }
             self._write_trajectory_md(out_dir, trajectory, extra_info=extra)

@@ -48,6 +48,39 @@ def _resolve_path(value: str, fallback_base: Path | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Real-time evaluation progress logging helper
+# ---------------------------------------------------------------------------
+
+def _log_eval_progress(result: dict, results_so_far: list[dict], total_instances: int) -> None:
+    """实时打印单实例评估结果 + 当前累计 resolved rate。"""
+    instance_id = result.get("instance_id", "?")
+    has_error = bool(result.get("error"))
+    resolved = bool(result.get("resolved", False))
+
+    done = len(results_so_far)
+    resolved_count = sum(1 for r in results_so_far if r.get("resolved", False))
+    error_count = sum(1 for r in results_so_far if r.get("error"))
+    rate = (resolved_count / done * 100) if done > 0 else 0.0
+
+    metrics = result.get("metrics", {}) or {}
+    total_metrics = metrics.get("total", {}) if isinstance(metrics, dict) else {}
+    total_tokens = total_metrics.get("total_tokens") if isinstance(total_metrics, dict) else None
+
+    status = "ERROR " if has_error else ("RESOLVED=True " if resolved else "RESOLVED=False")
+    parts = [
+        f"[Eval {done:>3}/{total_instances}] {instance_id} → {status}",
+        f"running {resolved_count}/{done} ({rate:.1f}%)",
+        f"errors={error_count}",
+    ]
+    if total_tokens:
+        parts.append(f"tokens={total_tokens:,}")
+    if has_error:
+        err_preview = str(result.get("error", ""))[:120]
+        parts.append(f"err={err_preview!r}")
+    logger.info(" | ".join(parts))
+
+
+# ---------------------------------------------------------------------------
 # Baseline / PlanMode worker
 # ---------------------------------------------------------------------------
 
@@ -409,6 +442,7 @@ def main():
             for task in tasks:
                 result = run_single_instance_planning_execution(task)
                 results.append(result)
+                _log_eval_progress(result, results, len(instances))
         else:
             worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))
             with ProcessPoolExecutor(max_workers=args.parallel) as executor:
@@ -428,6 +462,7 @@ def main():
                         logger.error(f"Future failed for {instance_id}: {e}")
                         result = {"instance_id": instance_id, "error": str(e), "resolved": False}
                     results.append(result)
+                    _log_eval_progress(result, results, len(instances))
 
         output_file = os.path.join(args.output_dir, "results.json")
         with open(output_file, "w") as f:
@@ -494,7 +529,7 @@ def main():
                     "resolved": False,
                 }
             results.append(result)
-            logger.info(f"Progress: {len(results)}/{len(instances)}")
+            _log_eval_progress(result, results, len(instances))
 
     output_file = os.path.join(args.output_dir, "results.json")
     with open(output_file, "w") as f:

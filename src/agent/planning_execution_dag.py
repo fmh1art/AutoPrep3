@@ -298,6 +298,7 @@ class DAGPlanningAgent:
             api_key=llm_cfg.get("key", llm_cfg.get("api_key", "")),
             base_url=llm_cfg.get("openai_base_url", llm_cfg.get("base_url", None)),
             api_version=llm_cfg.get("api_version", None),
+            cache_server_url=llm_cfg.get("cache_server_url"),
         )
 
     @property
@@ -815,7 +816,7 @@ class DAGOperatorExecutor:
                 path = tool_args.get("path", "")
                 if path:
                     read.add(path)
-            elif tool_name == "bash":
+            elif tool_name in ("bash", "terminal"):
                 cmd = tool_args.get("command", "")
                 for match in re.finditer(r'(?:cat|head|tail|less|more)\s+(\S+)', cmd):
                     read.add(match.group(1))

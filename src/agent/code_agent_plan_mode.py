@@ -79,6 +79,7 @@ class CodeAgentPlanMode:
                 api_key=getattr(planner_llm, "api_key", ""),
                 base_url=getattr(planner_llm, "base_url", None),
                 api_version=getattr(planner_llm, "api_version", None),
+                cache_server_url=getattr(planner_llm, "cache_server_url", None),
             )
             self.executor_llm = executor_llm
             self.tools = tools
@@ -90,6 +91,7 @@ class CodeAgentPlanMode:
                 api_key=planner_cfg["key"],
                 base_url=planner_cfg.get("openai_base_url"),
                 api_version=planner_cfg.get("api_version"),
+                cache_server_url=planner_cfg.get("cache_server_url"),
             )
             self.executor_llm = executor_llm
             self.tools = tools

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-计算 PlanAgent 模式的 accuracy 和平均 API cost per case。
+计算 COAT V0 (PlanAgent) 模式的 accuracy 和平均 API cost per case。
 
 用法:
   python example/eval_plan_agent.py --results /path/to/results.json --config _config/doubao.yaml
@@ -49,7 +49,7 @@ def compute_cost(metrics: dict, prices: dict) -> float:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="计算 PlanAgent 模式的 accuracy 和平均 API cost")
+    parser = argparse.ArgumentParser(description="计算 COAT V0 (PlanAgent) 模式的 accuracy 和平均 API cost")
     parser.add_argument("--results", type=str, required=True, help="results.json 路径")
     parser.add_argument("--config", type=str, default=None, help="LLM 配置 yaml（含 price_dollar_per_token）")
     args = parser.parse_args()
@@ -114,7 +114,26 @@ def main():
     avg_subtasks = sum(subtask_counts) / len(subtask_counts) if subtask_counts else 0
 
     print("=" * 60)
-    print("  PlanAgent Evaluation Report")
+    print("  Per-Instance Results (in order, with running resolved rate)")
+    print("=" * 60)
+    running_resolved = 0
+    for i, r in enumerate(results, start=1):
+        iid = r.get("instance_id", "?")
+        has_error = bool(r.get("error"))
+        is_resolved = bool(r.get("resolved", False))
+        if is_resolved:
+            running_resolved += 1
+        rate = running_resolved / i * 100
+        status = "ERROR " if has_error else ("RESOLVED=True " if is_resolved else "RESOLVED=False")
+        tokens = r.get("metrics", {}).get("total", {}).get("total_tokens", 0)
+        print(
+            f"  [{i:>3}/{total}] {iid:<40} → {status} | "
+            f"running {running_resolved}/{i} ({rate:.1f}%) | tokens={tokens:,}"
+        )
+    print()
+
+    print("=" * 60)
+    print("  COAT V0 PlanAgent Evaluation Report")
     print("=" * 60)
     print()
     print(f"Results file: {args.results}")

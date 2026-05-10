@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from openai import AzureOpenAI, OpenAI, APIConnectionError
 from src.tools.funcs import open_json, save_json
 
+import requests as http_requests
+
 logger = logging.getLogger(__name__)
 
 # set seed
@@ -19,11 +21,12 @@ class SimpleAPICaller:
     - 在每次调用后，记录并累计 token 消耗，支持按 input / output / cached 等维度查看。
     """
 
-    def __init__(self, llm_name: str, api_key: str, base_url: str | None = None, api_version: str | None = None):
+    def __init__(self, llm_name: str, api_key: str, base_url: str | None = None, api_version: str | None = None, cache_server_url: str | None = None):
         self.llm_name = llm_name
         self.api_key = api_key
         self.base_url = base_url
         self.api_version = api_version
+        self._cache_server_url = cache_server_url
 
         # 最近一次调用的 token 统计
         self._last_usage: dict | None = None
@@ -54,6 +57,30 @@ class SimpleAPICaller:
             )
 
         self._use_responses_api = self.base_url and self.base_url.rstrip("/").endswith("/responses")
+
+    def _handle_cache(self, messages: list[dict], response_msg: dict | str | None) -> None:
+        if not self._cache_server_url:
+            return
+        try:
+            if self._last_usage is not None and self._last_usage.get("cached_tokens", 0) == 0:
+                resp = http_requests.post(
+                    f"{self._cache_server_url}/query_and_cache",
+                    json={"input_messages": messages, "response_msg": response_msg},
+                    timeout=5,
+                )
+                resp.raise_for_status()
+                computed = resp.json().get("cached_tokens", 0)
+                if computed > 0:
+                    self._last_usage["cached_tokens"] = computed
+                    self._total_usage["cached_tokens"] += computed
+            else:
+                http_requests.post(
+                    f"{self._cache_server_url}/cache",
+                    json={"input_messages": messages, "response_msg": response_msg},
+                    timeout=5,
+                )
+        except Exception as e:
+            logger.warning(f"[SimpleAPICaller] Cached token server error: {e}")
 
     def chat(self, messages, **kwargs) -> str:
         """调用 LLM 进行对话。
@@ -107,7 +134,9 @@ class SimpleAPICaller:
 
         self._update_usage(completion)
 
-        return completion.choices[0].message.content
+        content = completion.choices[0].message.content
+        self._handle_cache(messages, content)
+        return content
 
     def _chat_via_responses(self, messages, **kwargs) -> str:
         """内部方法：通过 Responses API 调用 LLM。"""
@@ -146,7 +175,9 @@ class SimpleAPICaller:
                 for content_block in item.content:
                     if content_block.type == "output_text":
                         text_parts.append(content_block.text)
-        return "\n".join(text_parts)
+        result = "\n".join(text_parts)
+        self._handle_cache(messages, result)
+        return result
 
     def chat_with_tools(self, messages: list, tools: list[dict], **kwargs):
         if "timeout" not in kwargs:
@@ -174,7 +205,10 @@ class SimpleAPICaller:
         self._update_usage(completion)
 
         choice = completion.choices[0]
-        return choice.message
+        msg = choice.message
+        response_dict = self._message_to_dict(msg)
+        self._handle_cache(messages, response_dict)
+        return msg
 
     def _convert_tools_for_responses(self, tools: list[dict]) -> list[dict]:
         converted = []
@@ -190,6 +224,29 @@ class SimpleAPICaller:
             else:
                 converted.append(tool)
         return converted
+
+    @staticmethod
+    def _message_to_dict(msg) -> dict:
+        result = {"role": getattr(msg, "role", "assistant")}
+        content = getattr(msg, "content", None)
+        if content is not None:
+            result["content"] = content
+        tool_calls = getattr(msg, "tool_calls", None)
+        if tool_calls:
+            tc_list = []
+            for tc in tool_calls:
+                fn = getattr(tc, "function", None)
+                tc_dict = {
+                    "id": getattr(tc, "id", ""),
+                    "type": getattr(tc, "type", "function"),
+                    "function": {
+                        "name": getattr(fn, "name", "") if fn else "",
+                        "arguments": getattr(fn, "arguments", "{}") if fn else "{}",
+                    },
+                }
+                tc_list.append(tc_dict)
+            result["tool_calls"] = tc_list
+        return result
 
     def _log_api_error(self, e: Exception, mode: str = "") -> None:
         """根据错误类型记录不同级别的日志。"""
@@ -282,6 +339,9 @@ class SimpleAPICaller:
         msg.content = text_content
         msg.tool_calls = tool_calls_list if tool_calls_list else None
         msg.role = "assistant"
+
+        response_dict = self._message_to_dict(msg)
+        self._handle_cache(messages, response_dict)
         return msg
 
     def _update_usage(self, completion) -> None:

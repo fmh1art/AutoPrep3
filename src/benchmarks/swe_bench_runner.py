@@ -299,6 +299,7 @@ class SweBenchRunner:
         use_cost_estimation: bool = False,
         num_candidate_plans: int = 3,
         use_optimized_agent: bool = False,
+        use_optimized_tools: bool = False,
     ):
         self.exp_cfg = exp_cfg
         self.cheap_exp_cfg = cheap_exp_cfg
@@ -310,6 +311,7 @@ class SweBenchRunner:
         self.use_cost_estimation = use_cost_estimation
         self.num_candidate_plans = num_candidate_plans
         self.use_optimized_agent = use_optimized_agent
+        self.use_optimized_tools = use_optimized_tools
         self.main_log_path = configure_main_logger(self.tmp_root)
         self._setup_proxy_env()
 
@@ -617,8 +619,8 @@ class SweBenchRunner:
             )
 
             logger.info(
-                f"[{instance_id}] resolved={eval_result['resolved']} "
-                f"patch_applied={eval_result['patch_applied']}"
+                f"[Eval] {instance_id} → RESOLVED={eval_result['resolved']} "
+                f"| patch_applied={eval_result['patch_applied']}"
             )
 
             result = {
