@@ -2,6 +2,7 @@
 # Project-specific run artifacts
 ###############################################
 _tmp/
+.cache_server_pid
 parallel_*/
 fcm_test/log/
 fcm_test/swe_eval_logs/

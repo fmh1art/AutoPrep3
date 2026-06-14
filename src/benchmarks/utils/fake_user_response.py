@@ -145,7 +145,10 @@ def _should_stop(
         return True
 
     if not _agent_sent_message(events):
-        logger.warning("Conversation finished without FinishAction or agent message")
+        logger.info(
+            "Conversation finished (no FinishAction or agent message) after %d fake responses",
+            fake_response_count,
+        )
         return True
 
     if fake_response_count >= max_fake_responses:
@@ -212,3 +215,9 @@ def run_conversation_with_fake_user_response(
     logger.info(
         "Conversation completed. Total fake responses sent: %d", fake_response_count
     )
+
+
+def invalidate_remote_state_cache(conversation) -> None:
+    state = getattr(conversation, '_state', None)
+    if state is not None and hasattr(state, '_cached_state'):
+        state._cached_state = None

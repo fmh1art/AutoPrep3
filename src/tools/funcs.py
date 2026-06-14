@@ -1,4 +1,5 @@
 import os, json
+import logging
 import numpy as np
 import pandas as pd
 from datetime import date, datetime
@@ -10,11 +11,148 @@ from typing import Optional, Dict, Any
 # Jinja2 渲染支持
 try:
     from jinja2 import Environment, FileSystemLoader
-except Exception:  # 允许在未安装 jinja2 的环境下被导入（仅在使用时才会失败）
-    Environment = None  # type: ignore
-    FileSystemLoader = None  # type: ignore
+except Exception:
+    Environment = None
+    FileSystemLoader = None
+
+try:
+    import tiktoken
+except Exception:
+    tiktoken = None
 
 import re
+
+def seralize_message(messages: list[dict], step2message: dict, related_step_indexs: list[int] = None, step_observation_max_length: int = -1, with_step_string=True) -> str:
+    if related_step_indexs is None:
+        related_step_indexs = list(step2message.keys())
+    
+    related_step_indexs = list(set(related_step_indexs))
+    related_step_indexs = sorted(related_step_indexs)
+    parts = []
+    for step_index in related_step_indexs:
+        msg_indices = step2message.get(step_index)
+        if not msg_indices:
+            continue
+        for msg_idx in msg_indices:
+            if msg_idx < 0 or msg_idx >= len(messages):
+                continue
+            msg = messages[msg_idx]
+            role = msg.get("role", "?")
+            if role == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    tool_name = fn.get("name", "?")
+                    if tool_name == "finish":
+                        parts.append("The task completed normally by calling `finish`.")
+                        return "\n\n".join(parts)
+                    try:
+                        tool_args = json.loads(fn.get("arguments", "{}"))
+                    except (json.JSONDecodeError, TypeError):
+                        tool_args = {}
+                    
+                    if with_step_string:
+                        parts.append(f"Step {step_index}:")
+                    parts.append(f"Tool: {tool_name}")
+                    if tool_args:
+                        args_str = json.dumps(tool_args, ensure_ascii=False)
+                        if len(args_str) > 500:
+                            args_str = args_str[:500] + "..."
+                        parts.append(f"Args: {args_str}")
+            elif role == "tool":
+                content = msg.get("content", "")
+                if step_observation_max_length > 0 and len(content) > step_observation_max_length:
+                    content = content[:step_observation_max_length] + "\n... (truncated)"
+                if with_step_string:
+                    parts.append(f"Step {step_index} Observation:\n{content}")
+                else:
+                    parts.append(f"Observation:\n{content}")
+                parts.append("")
+
+    if not parts:
+        parts.append("The sub-agent was abnormally terminated (exceeded maximum steps).")
+
+    ret = "\n\n".join(parts)
+
+    if not with_step_string:
+        # remove any remaining [Step x] markers from tool observation content
+        # support multiple markers like [Step 23]  [Step 1] [Step 213]
+        ret = re.sub(r"\s*\[Step\s+\d+\]\s*", " ", ret)
+        ret = re.sub(r"[ \t]{2,}", " ", ret)
+        ret = re.sub(r"\n{3,}", "\n\n", ret).strip()
+
+    return ret
+
+def write_messages_to_markdown_format(messages):
+    lines = ["# Messages Log\n"]
+    for i, msg in enumerate(messages):
+        role = msg.get("role", "?")
+        content = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls", [])
+        tool_call_id = msg.get("tool_call_id", "")
+
+        if role == "system":
+            lines.append(f"## [{i}] System\n")
+            lines.append(f"```\n{content}\n```\n")
+        elif role == "user":
+            lines.append(f"## [{i}] User\n")
+            lines.append(f"```\n{content}\n```\n")
+        elif role == "assistant":
+            lines.append(f"## [{i}] Assistant\n")
+            if content:
+                lines.append(f"**Content:** {content}\n")
+            if tool_calls:
+                for tci, tc in enumerate(tool_calls):
+                    fn = tc.get("function", {})
+                    tc_name = fn.get("name", "?")
+                    tc_args = fn.get("arguments", "")
+                    lines.append(f"**Tool Call {tci}: `{tc_name}`**\n")
+                    try:
+                        args_parsed = json.loads(tc_args)
+                        lines.append(f"```json\n{json.dumps(args_parsed, ensure_ascii=False, indent=2)}\n```\n")
+                    except (json.JSONDecodeError, TypeError):
+                        lines.append(f"```json\n{tc_args}\n```\n")
+        elif role == "tool":
+            lines.append(f"## [{i}] Tool Response (id={tool_call_id})\n")
+            if len(content) > 2000:
+                lines.append(f"<details><summary>Output ({len(content)} chars)</summary>\n\n```\n{content}\n```\n\n</details>\n")
+            else:
+                lines.append(f"```\n{content}\n```\n")
+        else:
+            lines.append(f"## [{i}] {role}\n")
+            lines.append(f"```\n{content}\n```\n")
+
+    return "\n".join(lines)
+
+def compute_metrics(before: dict, after: dict) -> dict:
+    input_tokens = after.get("input_tokens", 0) - before.get("input_tokens", 0)
+    output_tokens = after.get("output_tokens", 0) - before.get("output_tokens", 0)
+    cached_tokens = after.get("cached_tokens", 0) - before.get("cached_tokens", 0)
+    uncached_tokens = input_tokens - cached_tokens
+    reasoning_tokens = after.get("reasoning_tokens", 0) - before.get("reasoning_tokens", 0)
+    total_tokens = after.get("total_tokens", 0) - before.get("total_tokens", 0)
+    return {
+        "prompt_tokens": input_tokens,
+        "completion_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cached_tokens": cached_tokens,
+        "uncached_tokens": uncached_tokens,
+        "total_tokens": total_tokens,
+        "accumulated_cost": 0.0,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+    }
+
+def setup_file_logger(logger: logging.Logger, output_dir: str, log_filename: str):
+    log_dir = os.path.join(output_dir, "log")
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, log_filename)
+    if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', '') == os.path.abspath(log_file) for h in logger.handlers):
+        handler = logging.FileHandler(log_file, encoding="utf-8")
+        handler.setLevel(logging.INFO)
+        handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        logger.addHandler(handler)
+    if logger.level > logging.INFO:
+        logger.setLevel(logging.INFO)
 
 def parse_any_string(rsp, code_type=None, hard_replace=None):
     if hard_replace != None:
@@ -108,6 +246,18 @@ def save_json(a, fn):
         print(f"Error saving JSON: {e}")
 
 
+def cal_token(text: str, model: str = "cl100k_base") -> int:
+    if not text:
+        return 0
+    if tiktoken is not None:
+        try:
+            enc = tiktoken.get_encoding(model)
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    return len(re.findall(r"\w+|[^\w\s]", text, flags=re.UNICODE))
+
+
 # ---------------------------
 # Jinja2 模板渲染通用工具
 # ---------------------------
@@ -173,3 +323,140 @@ def calculate_multi_step_cost_without_prefix(token_lis: list, inp_price: int, ou
         prev_obs = obs
 
     return total_cost
+
+
+def _parse_tool_args_for_display(tool_args):
+    if isinstance(tool_args, dict):
+        if "_raw" in tool_args:
+            try:
+                parsed = json.loads(tool_args["_raw"])
+                return {k: v for k, v in parsed.items() if k != "_trajectory_step_index"}
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return {k: v for k, v in tool_args.items() if k != "_trajectory_step_index"}
+    if isinstance(tool_args, str):
+        try:
+            parsed = json.loads(tool_args)
+            return {k: v for k, v in parsed.items() if k != "_trajectory_step_index"}
+        except (json.JSONDecodeError, TypeError):
+            return {"_raw": tool_args}
+    return {}
+
+
+def render_trajectory_md(trajectory: list[dict], extra_info: dict | None = None) -> str:
+    lines: list[str] = []
+    lines.append("# Agent Trajectory\n")
+
+    if extra_info:
+        for k, v in extra_info.items():
+            lines.append(f"- **{k}**: {v}")
+        lines.append("")
+
+    for record in trajectory:
+        idx = record.get("index", "?")
+        role = record.get("role", "?")
+
+        if role == "initial_prompt":
+            lines.append("## Initial Prompt\n")
+            msgs = record.get("messages", [])
+            for mi, m in enumerate(msgs):
+                m_role = m.get("role", "?")
+                m_content = m.get("content", "")
+                if m_content is None:
+                    m_content = ""
+                m_content = str(m_content)
+                tool_calls = m.get("tool_calls", [])
+                tool_call_id = m.get("tool_call_id", "")
+
+                if m_role == "system":
+                    lines.append(f"### [{mi}] System\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+                elif m_role == "user":
+                    lines.append(f"### [{mi}] User\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+                elif m_role == "assistant":
+                    m_reasoning = m.get("reasoning_content", "")
+                    lines.append(f"### [{mi}] Assistant\n")
+                    if m_reasoning:
+                        lines.append(f"<details><summary>Reasoning</summary>\n\n{m_reasoning}\n\n</details>\n")
+                    if m_content:
+                        lines.append(f"**Content:** {m_content}\n")
+                    if tool_calls:
+                        for tci, tc in enumerate(tool_calls):
+                            fn = tc.get("function", {})
+                            tc_name = fn.get("name", "?")
+                            tc_args = fn.get("arguments", "")
+                            lines.append(f"**Tool Call {tci}: `{tc_name}`**\n")
+                            try:
+                                args_parsed = json.loads(tc_args)
+                                args_display = {k: v for k, v in args_parsed.items() if k != "_trajectory_step_index"}
+                                lines.append(f"```json\n{json.dumps(args_display, ensure_ascii=False, indent=2)}\n```\n")
+                            except (json.JSONDecodeError, TypeError):
+                                lines.append(f"```json\n{tc_args}\n```\n")
+                elif m_role == "tool":
+                    lines.append(f"### [{mi}] Tool Response (id={tool_call_id})\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+                else:
+                    lines.append(f"### [{mi}] {m_role}\n")
+                    lines.append(f"```\n{m_content}\n```\n")
+            continue
+
+        if role == "assistant":
+            thinking = record.get("thinking", "")
+            reasoning = record.get("reasoning", "")
+            lines.append(f"## Step {idx} — Assistant\n")
+            if reasoning:
+                lines.append(f"<details><summary>Reasoning</summary>\n\n{reasoning}\n\n</details>\n")
+            if thinking:
+                lines.append(f"**Thinking:** {thinking}\n")
+            continue
+
+        if role == "tool":
+            tool_name = record.get("tool_name", "?")
+            tool_args = record.get("tool_args", {})
+            observation = record.get("observation", "")
+            thinking = record.get("thinking", "")
+            reasoning = record.get("reasoning", "")
+            finish_msg = record.get("finish_message")
+            useful_idx = record.get("useful_trajectory_indexes")
+
+            lines.append(f"## Step {idx} — Tool: `{tool_name}`\n")
+
+            if reasoning:
+                lines.append(f"<details><summary>Reasoning</summary>\n\n{reasoning}\n\n</details>\n")
+            if thinking:
+                lines.append(f"**Thinking:** {thinking}\n")
+
+            args_display = _parse_tool_args_for_display(tool_args)
+            if args_display:
+                lines.append("**Arguments:**\n")
+                lines.append(f"```json\n{json.dumps(args_display, ensure_ascii=False, indent=2)}\n```\n")
+
+            if observation:
+                lines.append("**Observation:**\n")
+                obs = str(observation)
+                if len(obs) > 2000:
+                    lines.append(f"<details><summary>Observation ({len(obs)} chars)</summary>\n\n```\n{obs}\n```\n\n</details>\n")
+                else:
+                    lines.append(f"```\n{obs}\n```\n")
+
+            if finish_msg:
+                lines.append(f"**Finish Message:** {finish_msg}\n")
+            if useful_idx:
+                lines.append(f"**Useful Trajectory Indexes:** {useful_idx}\n")
+
+            continue
+
+        if role == "transition":
+            lines.append(f"## Transition — Operator {idx} → {idx + 1}\n")
+            content = record.get("content", "")
+            if content:
+                lines.append(f"```\n{content}\n```\n")
+            continue
+
+        lines.append(f"## Step {idx} — {role}\n")
+        content = record.get("content") or record.get("observation") or ""
+        if content:
+            lines.append(f"```\n{content}\n```\n")
+
+    return "\n".join(lines)

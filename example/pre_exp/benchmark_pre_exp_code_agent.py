@@ -1,12 +1,10 @@
 """
-并行运行SWE-bench评估的脚本 — 基于 CustomizedCodeAgent
+并行运行SWE-bench评估的脚本 — 基于 PreExpCodeAgent
 """
 
 import argparse
 import json
 import os
-import shutil
-import subprocess
 import sys
 import time
 import traceback
@@ -25,9 +23,7 @@ from src.benchmarks.swebench.constants import GIT_COMMIT_MESSAGE, GIT_USER_EMAIL
 from src.benchmarks.swebench.swe_eval import run_swebench_eval
 from src.benchmarks.utils.log_setup import configure_main_logger
 from src.tools.funcs import render_j2
-from src.agent.code_agent import CustomizedCodeAgent
-from src.tools.codegraph_setup import setup_codegraph
-# from src.agent.meta_agent import MetaAgentWithTools
+from src.agent.pre_exp_code_agent import PreExpCodeAgent
 
 logger = logging.getLogger(__name__)
 
@@ -35,11 +31,6 @@ for _ln in ("uvicorn.access", "uvicorn.error", "httpcore", "httpx"):
     logging.getLogger(_ln).setLevel(logging.WARNING)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _safe_path_part(value: str) -> str:
-    """Return a filesystem-safe path component while keeping names readable."""
-    return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in value)
 
 
 def _resolve_path(value: str, fallback_base: Path | None = None) -> str:
@@ -76,181 +67,13 @@ def _log_eval_progress(result: dict, results_so_far: list[dict], total_instances
     logger.info(" | ".join(parts))
 
 
-def _snapshot_initial_workspace(
-    workspace,
-    repo_path: str,
-    snapshot_root: str,
-    instance_id: str,
-    repo_name: str,
-) -> str | None:
-    """Copy the freshly checked-out repo from the container to the host for debugging."""
-    if not snapshot_root:
-        return None
-
-    container_id = getattr(workspace, "_container_id", None)
-    if not container_id:
-        logger.warning(f"[Worker] Cannot snapshot {instance_id}: workspace has no container id")
-        return None
-
-    safe_instance_id = _safe_path_part(instance_id)
-    safe_repo_name = _safe_path_part(repo_name)
-    snapshot_dir = Path(snapshot_root) / safe_instance_id / safe_repo_name
-
-    try:
-        if snapshot_dir.exists():
-            shutil.rmtree(snapshot_dir)
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-
-        result = subprocess.run(
-            ["docker", "cp", f"{container_id}:{repo_path}/.", str(snapshot_dir)],
-            capture_output=True,
-            text=True,
-            timeout=float(os.getenv("INITIAL_WORKSPACE_SNAPSHOT_TIMEOUT", "300")),
-            check=False,
-        )
-        if result.returncode != 0:
-            logger.warning(
-                f"[Worker] Failed to snapshot initial workspace for {instance_id}: "
-                f"{(result.stderr or result.stdout).strip()[:500]}"
-            )
-            return None
-
-        logger.info(
-            f"[Worker] Snapshotted initial workspace for {instance_id} to {snapshot_dir}"
-        )
-        return str(snapshot_dir)
-    except Exception as e:
-        logger.warning(f"[Worker] Error snapshotting initial workspace for {instance_id}: {e}")
-        return None
-
-
-def _check_python_ratio(workspace, repo_path: str, timeout: float = 30.0) -> float:
-    """
-    检查项目中Python代码的比例。
-    
-    通过统计文件扩展名来计算Python代码占比。
-    只统计源代码文件，忽略构建产物、依赖目录等。
-    
-    Args:
-        workspace: DockerWorkspace实例
-        repo_path: 仓库路径
-        timeout: 命令超时时间
-        
-    Returns:
-        Python文件占源代码文件总数的比例 (0.0 - 1.0)
-    """
-    from openhands.workspace import DockerWorkspace
-    
-    # 要统计的源代码文件扩展名
-    CODE_EXTENSIONS = {
-        # Python
-        '.py', '.pyi',
-        # 其他常见语言
-        '.js', '.jsx', '.ts', '.tsx',
-        '.java', '.kt', '.scala',
-        '.cpp', '.c', '.h', '.hpp',
-        '.go', '.rs',
-        '.rb', '.php',
-        '.cs',
-        '.swift', '.m', '.mm',
-        '.sh', '.bash',
-        '.lua', '.pl',
-        '.r', '.m',
-        '.ex', '.exs',
-        '.clj', '.cljs',
-        '.hs',
-        '.ml', '.mli',
-        '.erl', '.hrl',
-    }
-    
-    # 要忽略的目录
-    IGNORE_DIRS = {
-        '.git', '.svn', '.hg',
-        'node_modules',
-        '__pycache__', '.pytest_cache', '.mypy_cache',
-        'venv', '.venv', 'env',
-        'build', 'dist',
-        'target',
-        'dist', 'build',
-        'node_modules',
-        '.next', '.nuxt',
-        'vendor',
-        'third_party',
-        'third-party',
-        'lib', 'libs',
-        'deps',
-    }
-    
-    try:
-        # 使用find命令统计文件，忽略指定目录
-        # 先统计所有源代码文件总数
-        find_cmd = (
-            f"cd {repo_path} && "
-            f"find . -type f "
-            f"-not -path '*/\\.*' "  # 忽略隐藏目录
-        )
-        
-        # 添加忽略目录
-        for ignore_dir in IGNORE_DIRS:
-            find_cmd += f"-not -path '*/{ignore_dir}/*' "
-        
-        # 统计所有源代码文件
-        ext_pattern = '|'.join('\\.' + ext.lstrip('.') for ext in CODE_EXTENSIONS)
-        total_cmd = find_cmd + f"| grep -E '\\.({ext_pattern})$' | wc -l"
-        
-        # 统计Python文件
-        py_cmd = find_cmd + "| grep -E '\\.(py|pyi)$' | wc -l"
-        
-        total_result = workspace.execute_command(total_cmd, timeout=timeout)
-        py_result = workspace.execute_command(py_cmd, timeout=timeout)
-        
-        if total_result.exit_code != 0 or py_result.exit_code != 0:
-            logger.warning(
-                f"[Worker] Failed to count files: "
-                f"total exit={total_result.exit_code}, py exit={py_result.exit_code}"
-            )
-            return 0.0
-        
-        try:
-            total_files = int(total_result.stdout.strip())
-            py_files = int(py_result.stdout.strip())
-        except (ValueError, TypeError):
-            logger.warning(
-                f"[Worker] Failed to parse file counts: "
-                f"total='{total_result.stdout}', py='{py_result.stdout}'"
-            )
-            return 0.0
-        
-        if total_files == 0:
-            logger.warning(f"[Worker] No source code files found in {repo_path}")
-            return 0.0
-        
-        ratio = py_files / total_files
-        logger.info(
-            f"[Worker] File count: {py_files} Python / {total_files} total source files "
-            f"({ratio:.1%})"
-        )
-        
-        return ratio
-        
-    except Exception as e:
-        logger.warning(f"[Worker] Error checking Python ratio: {e}")
-        return 0.0
-
-
 def run_single_instance(args_dict):
-    """Worker: 对单个 SWE-bench 实例执行完整的 clone → agent.run → git patch → eval 流程。"""
     instance = args_dict["instance"]
     llm_cfg = args_dict["llm_cfg"]
     max_steps = args_dict["max_steps"]
+    keep_read_cnt = args_dict["keep_read_cnt"]
     tmp_root = args_dict["tmp_root"]
     runner_config = args_dict["runner_config"]
-    agent_type = args_dict.get("agent_type", "code")
-    max_steps_per_subagent = args_dict.get("max_steps_per_subagent", 80)
-    skill_path = args_dict.get("skill_path")
-    use_codegraph = args_dict.get("use_codegraph", False)
-    use_new_code_graph = args_dict.get("use_new_code_graph", False)
-    initial_workspaces_dir = args_dict.get("initial_workspaces_dir")
 
     instance_id = instance["instance_id"]
     repo_name = instance["repo"].split("/")[-1]
@@ -263,11 +86,9 @@ def run_single_instance(args_dict):
 
     workspace = None
     try:
-        # 1. 启动 DockerWorkspace
         runner = SweBenchRunner(**runner_config)
         workspace = runner.prepare_workspace(instance)
 
-        # 2. 克隆仓库到 base_commit
         repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
         clone_result = workspace.execute_command(
             f"rm -rf {repo_path} && "
@@ -291,53 +112,6 @@ def run_single_instance(args_dict):
                 f"git checkout failed for {instance_id}: {checkout_result.stderr or checkout_result.stdout}"
             )
 
-        _snapshot_initial_workspace(
-            workspace=workspace,
-            repo_path=repo_path,
-            snapshot_root=initial_workspaces_dir,
-            instance_id=instance_id,
-            repo_name=repo_name,
-        )
-
-        # 3.4 检查项目中Python代码的比例，决定是否使用code graph
-        use_codegraph_for_instance = use_codegraph
-        use_new_code_graph_for_instance = use_new_code_graph
-
-        if use_codegraph or use_new_code_graph:
-            python_ratio = _check_python_ratio(workspace, repo_path)
-            logger.info(
-                f"[Worker] Python code ratio for {instance_id}: {python_ratio:.1%}"
-            )
-
-            # 只有当Python代码比例超过50%时才使用code graph
-            PYTHON_RATIO_THRESHOLD = 0.0
-            if python_ratio < PYTHON_RATIO_THRESHOLD:
-                logger.warning(
-                    f"[Worker] Python code ratio ({python_ratio:.1%}) below threshold "
-                    f"({PYTHON_RATIO_THRESHOLD:.0%}) for {instance_id}; "
-                    f"disabling code graph, falling back to normal code agent."
-                )
-                use_codegraph_for_instance = False
-                use_new_code_graph_for_instance = False
-
-        # 3.5 (optional) 安装 codegraph CLI 并构建知识图谱索引
-        if use_new_code_graph_for_instance:
-            from src.tools.codegraph_setup import setup_codegraph_py
-            ok = setup_codegraph_py(workspace, repo_path)
-            if not ok:
-                logger.warning(
-                    f"[Worker] New CodeGraphPy setup failed for {instance_id}; "
-                    f"agent will fall back to grep/Read."
-                )
-        elif use_codegraph_for_instance:
-            ok = setup_codegraph(workspace, repo_path)
-            if not ok:
-                logger.warning(
-                    f"[Worker] CodeGraph setup failed for {instance_id}; "
-                    f"agent will fall back to grep/Read."
-                )
-
-        # 3. 渲染 task prompt
         task_description = render_j2(
             template_name="query.j2",
             context={
@@ -347,35 +121,17 @@ def run_single_instance(args_dict):
             },
         )
 
-        # 4. 创建 Agent 并运行
-        if agent_type == "meta":
-            # agent = MetaAgentWithTools(
-            #     llm_cfg=llm_cfg,
-            #     output_dir=log_dir,
-            #     max_step=max_steps,
-            #     max_steps_per_subagent=max_steps_per_subagent,
-            # )
-            # agent.run(
-            #     task_instruction=task_description,
-            #     workspace=workspace,
-            #     # problem_statement=str(instance.get("problem_statement", "")).strip()
-            # )
-            pass
-        else:
-            agent = CustomizedCodeAgent(
-                llm_cfg=llm_cfg,
-                output_dir=log_dir,
-                max_step=max_steps,
-                skill_path=skill_path,
-                use_codegraph=use_codegraph_for_instance,
-                use_new_code_graph=use_new_code_graph_for_instance,
-            )
-            agent.run(
-                task_instruction=task_description,
-                workspace=workspace,
-            )
+        agent = PreExpCodeAgent(
+            llm_cfg=llm_cfg,
+            output_dir=log_dir,
+            max_step=max_steps,
+        )
+        agent.run(
+            task_instruction=task_description,
+            workspace=workspace,
+            keep_read_cnt=keep_read_cnt,
+        )
 
-        # 5. 清理临时文件 + git add/commit
         workspace.execute_command(
             f"cd {repo_path} && "
             f"find . -name '*.bak' -delete && "
@@ -390,13 +146,11 @@ def run_single_instance(args_dict):
             f"git commit --no-verify -m '{GIT_COMMIT_MESSAGE}' || true"
         )
 
-        # 6. 获取 git patch
         diff_result = workspace.execute_command(
             f"cd {repo_path} && git --no-pager diff --no-color {base_commit} HEAD"
         )
         git_patch = diff_result.stdout if diff_result.exit_code == 0 else ""
 
-        # 7. SWE-bench 原生 evaluation
         eval_result = run_swebench_eval(
             instance=instance,
             git_patch=git_patch,
@@ -520,22 +274,13 @@ def generate_total_records(output_dir: str, llm_cfg: dict, exp_config_name: str)
         total_tokens = overall.get("total_tokens", 0)
         use_time = overall.get("use_time", 0)
 
-        execution = overall.get("execution", {})
-        exec_input_tokens = execution.get("input_tokens", 0)
-        exec_output_tokens = execution.get("output_tokens", 0)
-        exec_cached_input_tokens = execution.get("cached_tokens", 0)
-        exec_uncached_input_tokens = execution.get("uncached_tokens", 0)
-        exec_reasoning_tokens = execution.get("reasoning_tokens", 0)
-        exec_total_tokens = execution.get("total_tokens", 0)
-        exec_use_time = execution.get("use_time", 0)
-
-        combined_input = input_tokens + exec_input_tokens
-        combined_output = output_tokens + exec_output_tokens
-        combined_cached_input = cached_input_tokens + exec_cached_input_tokens
-        combined_uncached_input = uncached_input_tokens + exec_uncached_input_tokens
-        combined_reasoning = reasoning_tokens + exec_reasoning_tokens
-        combined_total = total_tokens + exec_total_tokens
-        combined_use_time = use_time + exec_use_time
+        combined_input = input_tokens
+        combined_output = output_tokens
+        combined_cached_input = cached_input_tokens
+        combined_uncached_input = uncached_input_tokens
+        combined_reasoning = reasoning_tokens
+        combined_total = total_tokens
+        combined_use_time = use_time
 
         cost = _calculate_cost(combined_uncached_input, combined_output, combined_cached_input, pricing)
 
@@ -554,26 +299,6 @@ def generate_total_records(output_dir: str, llm_cfg: dict, exp_config_name: str)
             "use_time_seconds": round(combined_use_time, 2),
             cost_suffix: round(cost, 6),
         }
-
-        if execution:
-            inst_record["meta_agent_tokens"] = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "cached_input_tokens": cached_input_tokens,
-                "uncached_input_tokens": uncached_input_tokens,
-                "reasoning_tokens": reasoning_tokens,
-                "total_tokens": total_tokens,
-                "use_time": round(use_time, 2),
-            }
-            inst_record["execution_tokens"] = {
-                "input_tokens": exec_input_tokens,
-                "output_tokens": exec_output_tokens,
-                "cached_input_tokens": exec_cached_input_tokens,
-                "uncached_input_tokens": exec_uncached_input_tokens,
-                "reasoning_tokens": exec_reasoning_tokens,
-                "total_tokens": exec_total_tokens,
-                "use_time": round(exec_use_time, 2),
-            }
 
         per_instance.append(inst_record)
 
@@ -664,68 +389,35 @@ def generate_total_records(output_dir: str, llm_cfg: dict, exp_config_name: str)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="并行运行SWE-bench评估 — CustomizedCodeAgent")
+    parser = argparse.ArgumentParser(description="并行运行SWE-bench评估 — PreExpCodeAgent")
     parser.add_argument("--dataset", type=str, required=True, help="数据集路径")
     parser.add_argument("--split", type=str, default="test", help="数据集split")
     parser.add_argument("--eval-limit", type=int, default=0, help="评估实例数量限制")
-    parser.add_argument("--selected-instances", type=str, default=None, help="选定实例文件") 
+    parser.add_argument("--selected-instances", type=str, default=None, help="选定实例文件")
     parser.add_argument("--exp-config", type=str, required=True, help="模型配置文件(yaml)")
     parser.add_argument("--max-steps", type=int, default=200, help="Agent最大步数")
-    parser.add_argument("--agent-type", type=str, default="code", choices=["code", "meta"], help="Agent类型: code或meta")
-    parser.add_argument("--max-steps-per-subagent", type=int, default=80, help="Meta agent每个sub-agent的最大步数")
+    parser.add_argument("--keep-read-cnt", type=int, default=-1, help="保留未折叠的Read observation数量，-1表示不折叠")
     parser.add_argument("--parallel", type=int, default=8, help="并行数")
     parser.add_argument("--output-dir", type=str, default=None, help="输出目录")
     parser.add_argument("--http-proxy", type=str, default="http://sys-proxy-rd-relay.byted.org:8118", help="HTTP 代理")
     parser.add_argument("--no-proxy", type=str, default="localhost,127.0.0.1,::1,bytedance.net,byted.org", help="No proxy")
-    parser.add_argument("--skill-path", type=str, default=None, help="Skill目录路径，若指定则自动启用skill")
-    parser.add_argument(
-        "--initial-workspaces-dir",
-        type=str,
-        default="./_tmp/workspacces",
-        help=(
-            "保存每个case刚clone并checkout到base_commit后的初始workspace目录；"
-            "默认保存到 ./_tmp/workspacces，设置为空字符串可关闭。"
-        ),
-    )
-    parser.add_argument(
-        "--use-codegraph",
-        action="store_true",
-        help=(
-            "启用 CodeGraph：clone repo 后在容器内安装 @colbymchenry/codegraph 并构建 .codegraph/ 索引，"
-            "同时为 agent 注册 codegraph_* 工具，显著降低 grep/Read token 成本。"
-        ),
-    )
-    parser.add_argument(
-        "--use-new-code-graph",
-        action="store_true",
-        help=(
-            "启用新的 CodeGraphPy（Python专用）：clone repo 后在容器内安装 codegraph-py 并构建 .codegraph_py/ 索引，"
-            "提供更精确的位置信息（行范围、列）和 Python 优化的分析。"
-            "与 --use-codegraph 互斥，优先使用本参数。"
-        ),
-    )
     args = parser.parse_args()
 
-    # 路径解析
     args.exp_config = _resolve_path(args.exp_config)
 
-    # 加载配置
     with open(args.exp_config, "r", encoding="utf-8") as f:
         llm_cfg = yaml.safe_load(f)
 
     if args.output_dir is None:
         exp_name = Path(args.exp_config).stem
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-        args.output_dir = f"./_tmp/{args.agent_type}_agent_limit{args.eval_limit}_{exp_name}_{timestamp}"
+        args.output_dir = f"./_tmp/pre_exp_code_agent_limit{args.eval_limit}_{exp_name}_{timestamp}"
     args.output_dir = _resolve_path(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
-    if args.initial_workspaces_dir:
-        args.initial_workspaces_dir = _resolve_path(args.initial_workspaces_dir)
-        os.makedirs(args.initial_workspaces_dir, exist_ok=True)
-
     config_snapshot_dir = os.path.join(args.output_dir, "configs")
     os.makedirs(config_snapshot_dir, exist_ok=True)
+    import shutil
     if os.path.isfile(args.exp_config):
         shutil.copy2(args.exp_config, os.path.join(config_snapshot_dir, os.path.basename(args.exp_config)))
 
@@ -735,13 +427,10 @@ def main():
         "eval_limit": args.eval_limit,
         "exp_config": os.path.basename(args.exp_config),
         "max_steps": args.max_steps,
-        "agent_type": args.agent_type,
-        "max_steps_per_subagent": args.max_steps_per_subagent,
+        "keep_read_cnt": args.keep_read_cnt,
+        "agent_type": "pre_exp_code",
         "parallel": args.parallel,
         "output_dir": args.output_dir,
-        "initial_workspaces_dir": args.initial_workspaces_dir,
-        "use_codegraph": args.use_codegraph,
-        "use_new_code_graph": args.use_new_code_graph,
     }
     with open(os.path.join(config_snapshot_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(run_config_record, f, indent=2, ensure_ascii=False)
@@ -750,7 +439,6 @@ def main():
     logger.info(f"Output: {args.output_dir}, Parallel: {args.parallel}")
     logger.info(f"Main log file: {main_log_path}")
 
-    # 构建 runner_config（仅用于 prepare_instances + prepare_workspace）
     runner_config = {
         "exp_cfg": llm_cfg,
         "tmp_root": args.output_dir,
@@ -760,7 +448,6 @@ def main():
         "max_steps": args.max_steps,
     }
 
-    # 加载数据集
     runner = SweBenchRunner(**runner_config)
     instances = runner.prepare_instances(
         dataset=args.dataset,
@@ -770,25 +457,18 @@ def main():
     )
     logger.info(f"Total instances: {len(instances)}")
 
-    # 构造 tasks
     tasks = [
         {
             "instance": inst,
             "llm_cfg": llm_cfg,
             "max_steps": args.max_steps,
+            "keep_read_cnt": args.keep_read_cnt,
             "tmp_root": args.output_dir,
             "runner_config": runner_config,
-            "agent_type": args.agent_type,
-            "max_steps_per_subagent": args.max_steps_per_subagent,
-            "skill_path": args.skill_path,
-            "use_codegraph": args.use_codegraph,
-            "use_new_code_graph": args.use_new_code_graph,
-            "initial_workspaces_dir": args.initial_workspaces_dir,
         }
         for inst in instances
     ]
 
-    # 并行执行
     results = []
     worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))
 
@@ -798,10 +478,8 @@ def main():
             results.append(result)
             _log_eval_progress(result, results, len(instances))
     else:
-        executor = ProcessPoolExecutor(max_workers=args.parallel)
-        try:
+        with ProcessPoolExecutor(max_workers=args.parallel) as executor:
             futures = {executor.submit(run_single_instance, task): task for task in tasks}
-            pool_broken = False
             for future in as_completed(futures):
                 task = futures[future]
                 instance_id = task["instance"]["instance_id"]
@@ -813,32 +491,9 @@ def main():
                 except Exception as e:
                     logger.error(f"[Worker] Future failed for {instance_id}: {e}")
                     result = {"instance_id": instance_id, "error": str(e), "resolved": False}
-                    # 检测进程池崩溃：一旦某个 worker 进程异常终止，
-                    # 所有剩余 future 都会级联失败，提前终止避免大量重复报错
-                    err_msg = str(e).lower()
-                    if "process pool" in err_msg and "terminated" in err_msg:
-                        pool_broken = True
                 results.append(result)
                 _log_eval_progress(result, results, len(instances))
-                if pool_broken:
-                    logger.error(
-                        "[Worker] Process pool broken — marking remaining futures as errored"
-                    )
-                    for f, t in futures.items():
-                        if not f.done():
-                            fid = t["instance"]["instance_id"]
-                            results.append({
-                                "instance_id": fid,
-                                "error": "process pool terminated",
-                                "resolved": False,
-                            })
-                            _log_eval_progress(results[-1], results, len(instances))
-                    break
-        finally:
-            # wait=False 避免在已崩溃的进程上 hang 住
-            executor.shutdown(wait=False, cancel_futures=True)
 
-    # 保存结果
     output_file = os.path.join(args.output_dir, "results.json")
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
@@ -861,61 +516,36 @@ if __name__ == "__main__":
     main()
 
 """
-python example/benchmark_code_agent.py \
+python example/pre_exp/benchmark_pre_exp_code_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
   --split test \
   --eval-limit 64 \
   --exp-config _config/doubao.yaml \
   --max-steps 200 \
-  --parallel 8 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-
-
-
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified  \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/doubao.yaml \
-  --max-steps 200 \
+  --keep-read-cnt 1 \
   --parallel 8 \
   --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
   --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
   
-
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified  \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/deepseekv4_pro.yaml \
-  --max-steps 200 \
-  --parallel 8 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-
-
-python example/benchmark_code_agent.py \
+python example/pre_exp/benchmark_pre_exp_code_agent.py \
   --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
   --split test \
   --eval-limit 64 \
   --exp-config _config/doubao.yaml \
   --max-steps 200 \
-  --skill-path _tmp/skill_evolver_doubao_2026-05-21_09-41-06/.skill \
-  --agent-type code \
+  --keep-read-cnt 2 \
   --parallel 8 \
   --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
   --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
   
-  
-python example/benchmark_code_agent.py \
---dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
---split test \
---eval-limit 64 \
---exp-config _config/deepseekv4_flash.yaml \
---max-steps 200 \
---parallel 8 \
---use-codegraph \
---http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
---no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
+python example/pre_exp/benchmark_pre_exp_code_agent.py \
+  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+  --split test \
+  --eval-limit 64 \
+  --exp-config _config/doubao.yaml \
+  --max-steps 200 \
+  --keep-read-cnt 3 \
+  --parallel 8 \
+  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 """

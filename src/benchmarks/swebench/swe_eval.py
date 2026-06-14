@@ -100,7 +100,7 @@ def run_swebench_eval(
     test_spec = make_test_spec(instance, namespace=SWEBENCH_IMAGE_PREFIX)
 
     # 日志目录
-    log_dir = Path(tmp_dir) / "swe_eval_logs" / run_id / instance_id
+    log_dir = Path(tmp_dir) / "swe_eval_logs" / instance_id
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "eval.log"
     logger = setup_logger(instance_id, log_file)

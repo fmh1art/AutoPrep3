@@ -1,5 +1,17 @@
 """
-并行运行SWE-bench评估的脚本 — 基于 CustomizedCodeAgent
+并行运行SWE-bench评估脚本 — CustomizedCodeAgent + 新的 PyCodeGraph
+
+用法示例：
+    python example/benchmark_code_agent_with_pycodegraph.py \
+      --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
+      --split test \
+      --eval-limit 64 \
+      --exp-config _config/doubao.yaml \
+      --max-steps 200 \
+      --parallel 8 \
+      --use-pycodegraph \
+      --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
+      --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
 """
 
 import argparse
@@ -26,8 +38,11 @@ from src.benchmarks.swebench.swe_eval import run_swebench_eval
 from src.benchmarks.utils.log_setup import configure_main_logger
 from src.tools.funcs import render_j2
 from src.agent.code_agent import CustomizedCodeAgent
-from src.tools.codegraph_setup import setup_codegraph
-# from src.agent.meta_agent import MetaAgentWithTools
+from src.tools.codegraph_setup import (
+    setup_codegraph,
+    setup_codegraph_py,
+    setup_pycodegraph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +51,25 @@ for _ln in ("uvicorn.access", "uvicorn.error", "httpcore", "httpx"):
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
+# 三选一：优先级 PyCodeGraph > CodeGraphPy > CodeGraph
+CODE_GRAPH_KIND_NONE = "none"
+CODE_GRAPH_KIND_OLD = "codegraph"
+CODE_GRAPH_KIND_NEW_PY = "codegraph_py"
+CODE_GRAPH_KIND_PYCODEGRAPH = "pycodegraph"
+
+
+def _resolve_code_graph_kind(args) -> str:
+    """根据 CLI 参数解析出最终启用哪种 code graph。"""
+    if getattr(args, "use_pycodegraph", False):
+        return CODE_GRAPH_KIND_PYCODEGRAPH
+    if getattr(args, "use_new_code_graph", False):
+        return CODE_GRAPH_KIND_NEW_PY
+    if getattr(args, "use_codegraph", False):
+        return CODE_GRAPH_KIND_OLD
+    return CODE_GRAPH_KIND_NONE
+
 
 def _safe_path_part(value: str) -> str:
-    """Return a filesystem-safe path component while keeping names readable."""
     return "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "_" for ch in value)
 
 
@@ -83,7 +114,6 @@ def _snapshot_initial_workspace(
     instance_id: str,
     repo_name: str,
 ) -> str | None:
-    """Copy the freshly checked-out repo from the container to the host for debugging."""
     if not snapshot_root:
         return None
 
@@ -127,90 +157,69 @@ def _snapshot_initial_workspace(
 def _check_python_ratio(workspace, repo_path: str, timeout: float = 30.0) -> float:
     """
     检查项目中Python代码的比例。
-    
+
     通过统计文件扩展名来计算Python代码占比。
     只统计源代码文件，忽略构建产物、依赖目录等。
-    
-    Args:
-        workspace: DockerWorkspace实例
-        repo_path: 仓库路径
-        timeout: 命令超时时间
-        
+
     Returns:
         Python文件占源代码文件总数的比例 (0.0 - 1.0)
     """
-    from openhands.workspace import DockerWorkspace
-    
-    # 要统计的源代码文件扩展名
     CODE_EXTENSIONS = {
-        # Python
-        '.py', '.pyi',
-        # 其他常见语言
-        '.js', '.jsx', '.ts', '.tsx',
-        '.java', '.kt', '.scala',
-        '.cpp', '.c', '.h', '.hpp',
-        '.go', '.rs',
-        '.rb', '.php',
-        '.cs',
-        '.swift', '.m', '.mm',
-        '.sh', '.bash',
-        '.lua', '.pl',
-        '.r', '.m',
-        '.ex', '.exs',
-        '.clj', '.cljs',
-        '.hs',
-        '.ml', '.mli',
-        '.erl', '.hrl',
+        ".py", ".pyi",
+        ".js", ".jsx", ".ts", ".tsx",
+        ".java", ".kt", ".scala",
+        ".cpp", ".c", ".h", ".hpp",
+        ".go", ".rs",
+        ".rb", ".php",
+        ".cs",
+        ".swift", ".m", ".mm",
+        ".sh", ".bash",
+        ".lua", ".pl",
+        ".r",
+        ".ex", ".exs",
+        ".clj", ".cljs",
+        ".hs",
+        ".ml", ".mli",
+        ".erl", ".hrl",
     }
-    
-    # 要忽略的目录
     IGNORE_DIRS = {
-        '.git', '.svn', '.hg',
-        'node_modules',
-        '__pycache__', '.pytest_cache', '.mypy_cache',
-        'venv', '.venv', 'env',
-        'build', 'dist',
-        'target',
-        'dist', 'build',
-        'node_modules',
-        '.next', '.nuxt',
-        'vendor',
-        'third_party',
-        'third-party',
-        'lib', 'libs',
-        'deps',
+        ".git", ".svn", ".hg",
+        "node_modules",
+        "__pycache__", ".pytest_cache", ".mypy_cache",
+        "venv", ".venv", "env",
+        "build", "dist",
+        "target",
+        ".next", ".nuxt",
+        "vendor",
+        "third_party",
+        "third-party",
+        "lib", "libs",
+        "deps",
     }
-    
+
     try:
-        # 使用find命令统计文件，忽略指定目录
-        # 先统计所有源代码文件总数
         find_cmd = (
             f"cd {repo_path} && "
             f"find . -type f "
-            f"-not -path '*/\\.*' "  # 忽略隐藏目录
+            f"-not -path '*/\\.*' "
         )
-        
-        # 添加忽略目录
         for ignore_dir in IGNORE_DIRS:
             find_cmd += f"-not -path '*/{ignore_dir}/*' "
-        
-        # 统计所有源代码文件
+
         ext_pattern = '|'.join('\\.' + ext.lstrip('.') for ext in CODE_EXTENSIONS)
         total_cmd = find_cmd + f"| grep -E '\\.({ext_pattern})$' | wc -l"
-        
-        # 统计Python文件
         py_cmd = find_cmd + "| grep -E '\\.(py|pyi)$' | wc -l"
-        
+
         total_result = workspace.execute_command(total_cmd, timeout=timeout)
         py_result = workspace.execute_command(py_cmd, timeout=timeout)
-        
+
         if total_result.exit_code != 0 or py_result.exit_code != 0:
             logger.warning(
                 f"[Worker] Failed to count files: "
                 f"total exit={total_result.exit_code}, py exit={py_result.exit_code}"
             )
             return 0.0
-        
+
         try:
             total_files = int(total_result.stdout.strip())
             py_files = int(py_result.stdout.strip())
@@ -220,26 +229,25 @@ def _check_python_ratio(workspace, repo_path: str, timeout: float = 30.0) -> flo
                 f"total='{total_result.stdout}', py='{py_result.stdout}'"
             )
             return 0.0
-        
+
         if total_files == 0:
             logger.warning(f"[Worker] No source code files found in {repo_path}")
             return 0.0
-        
+
         ratio = py_files / total_files
         logger.info(
             f"[Worker] File count: {py_files} Python / {total_files} total source files "
             f"({ratio:.1%})"
         )
-        
         return ratio
-        
+
     except Exception as e:
         logger.warning(f"[Worker] Error checking Python ratio: {e}")
         return 0.0
 
 
 def run_single_instance(args_dict):
-    """Worker: 对单个 SWE-bench 实例执行完整的 clone → agent.run → git patch → eval 流程。"""
+    """Worker: 对单个 SWE-bench 实例执行完整的 clone → (可选)构建 PyCodeGraph → agent.run → git patch → eval 流程。"""
     instance = args_dict["instance"]
     llm_cfg = args_dict["llm_cfg"]
     max_steps = args_dict["max_steps"]
@@ -248,8 +256,7 @@ def run_single_instance(args_dict):
     agent_type = args_dict.get("agent_type", "code")
     max_steps_per_subagent = args_dict.get("max_steps_per_subagent", 80)
     skill_path = args_dict.get("skill_path")
-    use_codegraph = args_dict.get("use_codegraph", False)
-    use_new_code_graph = args_dict.get("use_new_code_graph", False)
+    code_graph_kind = args_dict.get("code_graph_kind", CODE_GRAPH_KIND_NONE)
     initial_workspaces_dir = args_dict.get("initial_workspaces_dir")
 
     instance_id = instance["instance_id"]
@@ -261,13 +268,16 @@ def run_single_instance(args_dict):
     log_dir = os.path.join(tmp_root, "log", instance_id)
     os.makedirs(log_dir, exist_ok=True)
 
+    # 根据项目语言比例决定是否启用 code graph（Python 项目才启用）
+    use_codegraph_for_instance = (code_graph_kind == CODE_GRAPH_KIND_OLD)
+    use_new_code_graph_for_instance = (code_graph_kind == CODE_GRAPH_KIND_NEW_PY)
+    use_pycodegraph_for_instance = (code_graph_kind == CODE_GRAPH_KIND_PYCODEGRAPH)
+
     workspace = None
     try:
-        # 1. 启动 DockerWorkspace
         runner = SweBenchRunner(**runner_config)
         workspace = runner.prepare_workspace(instance)
 
-        # 2. 克隆仓库到 base_commit
         repo_prepare_timeout = int(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
         clone_result = workspace.execute_command(
             f"rm -rf {repo_path} && "
@@ -299,17 +309,18 @@ def run_single_instance(args_dict):
             repo_name=repo_name,
         )
 
-        # 3.4 检查项目中Python代码的比例，决定是否使用code graph
-        use_codegraph_for_instance = use_codegraph
-        use_new_code_graph_for_instance = use_new_code_graph
-
-        if use_codegraph or use_new_code_graph:
+        # 对启用 code graph 的项目进行 Python 比例检测（本项目专为 Python 项目优化，
+        # 对非 Python 项目降级为普通 agent）
+        any_code_graph_enabled = (
+            use_codegraph_for_instance
+            or use_new_code_graph_for_instance
+            or use_pycodegraph_for_instance
+        )
+        if any_code_graph_enabled:
             python_ratio = _check_python_ratio(workspace, repo_path)
             logger.info(
                 f"[Worker] Python code ratio for {instance_id}: {python_ratio:.1%}"
             )
-
-            # 只有当Python代码比例超过50%时才使用code graph
             PYTHON_RATIO_THRESHOLD = 0.0
             if python_ratio < PYTHON_RATIO_THRESHOLD:
                 logger.warning(
@@ -319,25 +330,38 @@ def run_single_instance(args_dict):
                 )
                 use_codegraph_for_instance = False
                 use_new_code_graph_for_instance = False
+                use_pycodegraph_for_instance = False
 
-        # 3.5 (optional) 安装 codegraph CLI 并构建知识图谱索引
-        if use_new_code_graph_for_instance:
-            from src.tools.codegraph_setup import setup_codegraph_py
+        # 按优先级安装并构建对应的 code graph
+        if use_pycodegraph_for_instance:
+            # 新的 PyCodeGraph
+            logger.info(f"[Worker] Setting up PyCodeGraph for {instance_id} ...")
+            ok = setup_pycodegraph(workspace, repo_path)
+            if not ok:
+                logger.warning(
+                    f"[Worker] PyCodeGraph setup failed for {instance_id}; "
+                    f"agent will fall back to grep/Read."
+                )
+                use_pycodegraph_for_instance = False
+        elif use_new_code_graph_for_instance:
+            logger.info(f"[Worker] Setting up CodeGraphPy (new) for {instance_id} ...")
             ok = setup_codegraph_py(workspace, repo_path)
             if not ok:
                 logger.warning(
-                    f"[Worker] New CodeGraphPy setup failed for {instance_id}; "
+                    f"[Worker] CodeGraphPy setup failed for {instance_id}; "
                     f"agent will fall back to grep/Read."
                 )
+                use_new_code_graph_for_instance = False
         elif use_codegraph_for_instance:
+            logger.info(f"[Worker] Setting up original CodeGraph for {instance_id} ...")
             ok = setup_codegraph(workspace, repo_path)
             if not ok:
                 logger.warning(
                     f"[Worker] CodeGraph setup failed for {instance_id}; "
                     f"agent will fall back to grep/Read."
                 )
+                use_codegraph_for_instance = False
 
-        # 3. 渲染 task prompt
         task_description = render_j2(
             template_name="query.j2",
             context={
@@ -347,19 +371,7 @@ def run_single_instance(args_dict):
             },
         )
 
-        # 4. 创建 Agent 并运行
         if agent_type == "meta":
-            # agent = MetaAgentWithTools(
-            #     llm_cfg=llm_cfg,
-            #     output_dir=log_dir,
-            #     max_step=max_steps,
-            #     max_steps_per_subagent=max_steps_per_subagent,
-            # )
-            # agent.run(
-            #     task_instruction=task_description,
-            #     workspace=workspace,
-            #     # problem_statement=str(instance.get("problem_statement", "")).strip()
-            # )
             pass
         else:
             agent = CustomizedCodeAgent(
@@ -369,13 +381,13 @@ def run_single_instance(args_dict):
                 skill_path=skill_path,
                 use_codegraph=use_codegraph_for_instance,
                 use_new_code_graph=use_new_code_graph_for_instance,
+                use_pycodegraph=use_pycodegraph_for_instance,
             )
             agent.run(
                 task_instruction=task_description,
                 workspace=workspace,
             )
 
-        # 5. 清理临时文件 + git add/commit
         workspace.execute_command(
             f"cd {repo_path} && "
             f"find . -name '*.bak' -delete && "
@@ -390,13 +402,11 @@ def run_single_instance(args_dict):
             f"git commit --no-verify -m '{GIT_COMMIT_MESSAGE}' || true"
         )
 
-        # 6. 获取 git patch
         diff_result = workspace.execute_command(
             f"cd {repo_path} && git --no-pager diff --no-color {base_commit} HEAD"
         )
         git_patch = diff_result.stdout if diff_result.exit_code == 0 else ""
 
-        # 7. SWE-bench 原生 evaluation
         eval_result = run_swebench_eval(
             instance=instance,
             git_patch=git_patch,
@@ -430,7 +440,12 @@ def run_single_instance(args_dict):
 
 
 def _load_pricing(llm_cfg: dict) -> dict:
-    pricing = {"currency": "unknown", "input_token_price": 0.0, "output_token_price": 0.0, "cached_token_price": 0.0}
+    pricing = {
+        "currency": "unknown",
+        "input_token_price": 0.0,
+        "output_token_price": 0.0,
+        "cached_token_price": 0.0,
+    }
 
     if "price_yuan_per_million_token" in llm_cfg:
         p = llm_cfg["price_yuan_per_million_token"]
@@ -664,11 +679,13 @@ def generate_total_records(output_dir: str, llm_cfg: dict, exp_config_name: str)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="并行运行SWE-bench评估 — CustomizedCodeAgent")
+    parser = argparse.ArgumentParser(
+        description="并行运行SWE-bench评估 — CustomizedCodeAgent + PyCodeGraph"
+    )
     parser.add_argument("--dataset", type=str, required=True, help="数据集路径")
     parser.add_argument("--split", type=str, default="test", help="数据集split")
     parser.add_argument("--eval-limit", type=int, default=0, help="评估实例数量限制")
-    parser.add_argument("--selected-instances", type=str, default=None, help="选定实例文件") 
+    parser.add_argument("--selected-instances", type=str, default=None, help="选定实例文件")
     parser.add_argument("--exp-config", type=str, required=True, help="模型配置文件(yaml)")
     parser.add_argument("--max-steps", type=int, default=200, help="Agent最大步数")
     parser.add_argument("--agent-type", type=str, default="code", choices=["code", "meta"], help="Agent类型: code或meta")
@@ -691,32 +708,51 @@ def main():
         "--use-codegraph",
         action="store_true",
         help=(
-            "启用 CodeGraph：clone repo 后在容器内安装 @colbymchenry/codegraph 并构建 .codegraph/ 索引，"
-            "同时为 agent 注册 codegraph_* 工具，显著降低 grep/Read token 成本。"
+            "启用原始 CodeGraph（npm 版）。"
+            "clone repo 后在容器内安装 @colbymchenry/codegraph 并构建 .codegraph/ 索引，"
+            "同时为 agent 注册 codegraph_* 工具。"
         ),
     )
     parser.add_argument(
         "--use-new-code-graph",
         action="store_true",
         help=(
-            "启用新的 CodeGraphPy（Python专用）：clone repo 后在容器内安装 codegraph-py 并构建 .codegraph_py/ 索引，"
-            "提供更精确的位置信息（行范围、列）和 Python 优化的分析。"
-            "与 --use-codegraph 互斥，优先使用本参数。"
+            "启用 CodeGraphPy（Python专用）；"
+            "构建 .codegraph_py/ 索引，提供行/列精确位置信息。"
+        ),
+    )
+    parser.add_argument(
+        "--use-pycodegraph",
+        action="store_true",
+        help=(
+            "启用 PyCodeGraph（本项目新集成的零依赖 Python code graph）；"
+            "从 /home/fanmeihao/projects/PyCodeGraph 拷贝安装到容器，"
+            "构建 .pycodegraph/graph.json 索引并为 agent 注册 pycodegraph_* 工具。"
+            "与 --use-codegraph / --use-new-code-graph 互斥，本参数优先级最高。"
         ),
     )
     args = parser.parse_args()
 
-    # 路径解析
+    # 解析并校验 code graph 类型（三选一，若都设置则以 pycodegraph 优先）
+    code_graph_kind = _resolve_code_graph_kind(args)
+    if code_graph_kind == CODE_GRAPH_KIND_PYCODEGRAPH:
+        enabled_msg = "PyCodeGraph"
+    elif code_graph_kind == CODE_GRAPH_KIND_NEW_PY:
+        enabled_msg = "CodeGraphPy (new)"
+    elif code_graph_kind == CODE_GRAPH_KIND_OLD:
+        enabled_msg = "CodeGraph (original)"
+    else:
+        enabled_msg = "None"
+
     args.exp_config = _resolve_path(args.exp_config)
 
-    # 加载配置
     with open(args.exp_config, "r", encoding="utf-8") as f:
         llm_cfg = yaml.safe_load(f)
 
     if args.output_dir is None:
         exp_name = Path(args.exp_config).stem
         timestamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
-        args.output_dir = f"./_tmp/{args.agent_type}_agent_limit{args.eval_limit}_{exp_name}_{timestamp}"
+        args.output_dir = f"./_tmp/{args.agent_type}_agent_pycodegraph_limit{args.eval_limit}_{exp_name}_{timestamp}"
     args.output_dir = _resolve_path(args.output_dir)
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -740,17 +776,18 @@ def main():
         "parallel": args.parallel,
         "output_dir": args.output_dir,
         "initial_workspaces_dir": args.initial_workspaces_dir,
+        "code_graph_kind": code_graph_kind,
         "use_codegraph": args.use_codegraph,
         "use_new_code_graph": args.use_new_code_graph,
+        "use_pycodegraph": args.use_pycodegraph,
     }
     with open(os.path.join(config_snapshot_dir, "run_config.json"), "w", encoding="utf-8") as f:
         json.dump(run_config_record, f, indent=2, ensure_ascii=False)
 
     main_log_path = configure_main_logger(args.output_dir)
-    logger.info(f"Output: {args.output_dir}, Parallel: {args.parallel}")
+    logger.info(f"Output: {args.output_dir}, Parallel: {args.parallel}, CodeGraph: {enabled_msg}")
     logger.info(f"Main log file: {main_log_path}")
 
-    # 构建 runner_config（仅用于 prepare_instances + prepare_workspace）
     runner_config = {
         "exp_cfg": llm_cfg,
         "tmp_root": args.output_dir,
@@ -758,9 +795,11 @@ def main():
         "http_proxy": args.http_proxy,
         "no_proxy": args.no_proxy,
         "max_steps": args.max_steps,
+        "use_codegraph": (code_graph_kind == CODE_GRAPH_KIND_OLD),
+        "use_new_code_graph": (code_graph_kind == CODE_GRAPH_KIND_NEW_PY),
+        "use_pycodegraph": (code_graph_kind == CODE_GRAPH_KIND_PYCODEGRAPH),
     }
 
-    # 加载数据集
     runner = SweBenchRunner(**runner_config)
     instances = runner.prepare_instances(
         dataset=args.dataset,
@@ -770,7 +809,6 @@ def main():
     )
     logger.info(f"Total instances: {len(instances)}")
 
-    # 构造 tasks
     tasks = [
         {
             "instance": inst,
@@ -781,14 +819,12 @@ def main():
             "agent_type": args.agent_type,
             "max_steps_per_subagent": args.max_steps_per_subagent,
             "skill_path": args.skill_path,
-            "use_codegraph": args.use_codegraph,
-            "use_new_code_graph": args.use_new_code_graph,
+            "code_graph_kind": code_graph_kind,
             "initial_workspaces_dir": args.initial_workspaces_dir,
         }
         for inst in instances
     ]
 
-    # 并行执行
     results = []
     worker_timeout = int(os.getenv("WORKER_TIMEOUT", "7200"))
 
@@ -813,8 +849,6 @@ def main():
                 except Exception as e:
                     logger.error(f"[Worker] Future failed for {instance_id}: {e}")
                     result = {"instance_id": instance_id, "error": str(e), "resolved": False}
-                    # 检测进程池崩溃：一旦某个 worker 进程异常终止，
-                    # 所有剩余 future 都会级联失败，提前终止避免大量重复报错
                     err_msg = str(e).lower()
                     if "process pool" in err_msg and "terminated" in err_msg:
                         pool_broken = True
@@ -835,10 +869,8 @@ def main():
                             _log_eval_progress(results[-1], results, len(instances))
                     break
         finally:
-            # wait=False 避免在已崩溃的进程上 hang 住
             executor.shutdown(wait=False, cancel_futures=True)
 
-    # 保存结果
     output_file = os.path.join(args.output_dir, "results.json")
     with open(output_file, "w") as f:
         json.dump(results, f, indent=2, ensure_ascii=False)
@@ -859,63 +891,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-"""
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/doubao.yaml \
-  --max-steps 200 \
-  --parallel 8 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-
-
-
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified  \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/doubao.yaml \
-  --max-steps 200 \
-  --parallel 8 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-  
-
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified  \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/deepseekv4_pro.yaml \
-  --max-steps 200 \
-  --parallel 8 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-
-
-python example/benchmark_code_agent.py \
-  --dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
-  --split test \
-  --eval-limit 64 \
-  --exp-config _config/doubao.yaml \
-  --max-steps 200 \
-  --skill-path _tmp/skill_evolver_doubao_2026-05-21_09-41-06/.skill \
-  --agent-type code \
-  --parallel 8 \
-  --http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
-  --no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-  
-  
-python example/benchmark_code_agent.py \
---dataset ../_AutpPrep3_out/_data/SWEBenchVerified \
---split test \
---eval-limit 64 \
---exp-config _config/deepseekv4_flash.yaml \
---max-steps 200 \
---parallel 8 \
---use-codegraph \
---http-proxy http://sys-proxy-rd-relay.byted.org:8118 \
---no-proxy "localhost,127.0.0.1,::1,bytedance.net,byted.org"
-"""

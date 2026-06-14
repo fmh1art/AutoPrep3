@@ -26,6 +26,17 @@ def configure_main_logger(tmp_root: str, log_filename: str = "main_log.ansi") ->
     handler.setFormatter(build_log_formatter())
     handler._autoprep_log_path = log_path  # type: ignore[attr-defined]
     root_logger.addHandler(handler)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-8s %(name)s  %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    console_handler.setFormatter(console_formatter)
+    console_handler._autoprep_console = True  # type: ignore[attr-defined]
+    root_logger.addHandler(console_handler)
+
     if root_logger.level > logging.INFO:
         root_logger.setLevel(logging.INFO)
 
