@@ -1,0 +1,73 @@
+###############################################
+# Project-specific run artifacts
+###############################################
+_tmp/
+.cache_server_pid
+parallel_*/
+fcm_test/log/
+fcm_test/swe_eval_logs/
+workspace/conversations/
+oh_editor_history_*/
+*/log/
+*/swe_eval_logs/
+
+###############################################
+# Python
+###############################################
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+coverage.xml
+htmlcov/
+*.pyd
+*.pyo
+*.so
+
+###############################################
+# IDE / OS files
+###############################################
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+###############################################
+# Caches / Logs
+###############################################
+.cache/
+*.log
+
+
+###############################################
+# Secrets / Large files
+###############################################
+# Env files (avoid committing secrets)
+.env
+.env.*
+
+# Archives / compressed artifacts (often large, generated)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.gz
+*.bz2
+*.xz
+*.7z
+*.rar
+
+# Editor swap / temporary files
+*.swp
+*.swo
+*.tmp
+*.bak

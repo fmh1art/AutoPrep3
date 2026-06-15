@@ -1,0 +1,12 @@
+llm_name: kimi-k2.6
+key: sk-NcWPB1GxBz2VBN90ZEkVQ64ZfDK3ZM3A2GajS6LFRnnaIx6P
+openai_base_url: https://api.moonshot.cn/v1
+
+price_yuan_per_million_token:
+  input_token: 6.50
+  output_token: 27.00
+  cached_token: 1.10
+
+token_ratio:
+  k: 1.02
+  b: 4.67

@@ -1,0 +1,8 @@
+llm_name: GLM-4.5-Air
+key: 089393e35fb546fe8832cdc992d83935.2X3zPMUXVmLETE7H
+openai_base_url: https://open.bigmodel.cn/api/paas/v4
+
+price_dollar_per_token:
+  input_token: 0.0000012
+  output_token: 0.000008
+  cached_token: 0.00000000000000001
