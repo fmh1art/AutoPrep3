@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import logging
 import os
@@ -18,6 +19,20 @@ from statistics import median
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Import official SWE-bench constants directly to avoid package dependency issues
+def _load_official_swebench_specs():
+    swebench_repo = os.getenv(
+        "SWEBENCH_REPO_PATH",
+        "/home/fanmeihao/projects/_AutpPrep3_out/SWE-bench"
+    )
+    spec_path = f"{swebench_repo}/swebench/harness/constants/python.py"
+    spec = importlib.util.spec_from_file_location("swebench_constants_python", spec_path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.MAP_REPO_VERSION_TO_SPECS_PY
+
+MAP_REPO_VERSION_TO_SPECS = _load_official_swebench_specs()
 
 from src.agent.code_agent import CustomizedCodeAgent
 from src.benchmarks.swe_bench_runner import SweBenchRunner
@@ -45,11 +60,17 @@ def _log_eval_progress(result: dict, results_so_far: list[dict], total_instances
     instance_id = result.get("instance_id", "?")
     done = len(results_so_far)
     resolved_count = sum(1 for item in results_so_far if item.get("resolved", False))
-    error_count = sum(1 for item in results_so_far if item.get("error"))
+    error_count = sum(1 for item in results_so_far if item.get("error") and not item.get("skipped", False))
+    skipped_count = sum(1 for item in results_so_far if item.get("skipped", False))
     rate = (resolved_count / done * 100) if done else 0.0
-    status = "ERROR" if result.get("error") else f"RESOLVED={bool(result.get('resolved', False))}"
+    if result.get("skipped", False):
+        status = "SKIPPED"
+    elif result.get("error"):
+        status = "ERROR"
+    else:
+        status = f"RESOLVED={bool(result.get('resolved', False))}"
     logger.info(
-        "[Eval %3d/%d] %s | %s | running %d/%d (%.1f%%) | errors=%d",
+        "[Eval %3d/%d] %s | %s | running %d/%d (%.1f%%) | errors=%d | skipped=%d",
         done,
         total_instances,
         instance_id,
@@ -58,17 +79,40 @@ def _log_eval_progress(result: dict, results_so_far: list[dict], total_instances
         done,
         rate,
         error_count,
+        skipped_count,
     )
 
 
-def _prepare_repo(workspace, instance: dict) -> tuple[str, str, str]:
-    instance_id = instance["instance_id"]
-    repo_name = instance["repo"].split("/")[-1]
-    repo_path = f"/workspace/{repo_name}"
-    repo_url = f"https://github.com/{instance['repo']}.git"
-    base_commit = instance["base_commit"]
+def _prepare_repo(workspace, instance: dict) -> tuple[str, str, str, str, str]:
+    """
+    Prepare the repository and conda environment for the agent workspace.
+    Aligned with official SWE-bench implementation (swebench/harness/test_spec/python.py).
 
-    repo_prepare_timeout = float(os.getenv("REPO_PREPARE_TIMEOUT", "600"))
+    Official flow:
+    1. Clone repo and checkout base_commit
+    2. Git cleanup (remove remote, clean future tags, gc) - prevent information leak
+    3. Create conda env "testbed" with correct Python version
+    4. Install dependencies (requirements.txt/environment.yml + pip_packages)
+    5. Execute pre_install commands (system deps, config changes)
+    6. Install repo itself
+    7. Setup commit - ensure git diff only reflects agent changes
+    """
+    instance_id = instance["instance_id"]
+    repo = instance["repo"]
+    version = instance["version"]
+    repo_name = repo.split("/")[-1]
+    repo_path = f"/workspace/{repo_name}"
+    repo_url = f"https://github.com/{repo}.git"
+    base_commit = instance["base_commit"]
+    env_name = "testbed"  # Fixed name, aligned with official SWE-bench
+
+    # Get official specs for this repo+version
+    specs = MAP_REPO_VERSION_TO_SPECS[repo][version]
+    python_version = specs["python"]
+
+    repo_prepare_timeout = float(os.getenv("REPO_PREPARE_TIMEOUT", "1200"))
+
+    # ── Step 1: Clone repo ──────────────────────────────────────────────────
     clone_result = workspace.execute_command(
         f"rm -rf {repo_path} && "
         f"git init {repo_path} && "
@@ -91,7 +135,180 @@ def _prepare_repo(workspace, instance: dict) -> tuple[str, str, str]:
             f"git checkout failed for {instance_id}: {checkout_result.stderr or checkout_result.stdout}"
         )
 
-    return repo_name, repo_path, base_commit
+    # ── Step 2: Git cleanup (aligned with swebench/harness/test_spec/python.py:278-288) ──
+    # Remove remote and future tags to prevent information leak
+    git_cleanup_cmd = (
+        f"cd {repo_path} && "
+        "git remote remove origin && "
+        # Remove tags pointing to commits after target timestamp
+        f"TARGET_TIMESTAMP=$(git show -s --format=%ci {base_commit}) && "
+        'git tag -l | while read tag; do '
+        'TAG_COMMIT=$(git rev-list -n 1 "$tag"); '
+        'TAG_TIME=$(git show -s --format=%ci "$TAG_COMMIT"); '
+        'if [[ "$TAG_TIME" > "$TARGET_TIMESTAMP" ]]; then git tag -d "$tag"; fi; '
+        'done && '
+        "git reflog expire --expire=now --all && "
+        "git gc --prune=now --aggressive"
+    )
+    cleanup_result = workspace.execute_command(git_cleanup_cmd, timeout=120.0)
+    if cleanup_result.exit_code != 0:
+        logger.warning(
+            "[Worker] Git cleanup failed for %s: %s",
+            instance_id, cleanup_result.stderr or cleanup_result.stdout
+        )
+
+    # ── Step 3: Create conda environment ────────────────────────────────────
+    # Aligned with swebench/harness/test_spec/python.py:333-402
+    conda_init = "source /opt/miniconda3/etc/profile.d/conda.sh"
+
+    # Create conda environment
+    pkgs = specs.get("packages", "")
+    if pkgs == "requirements.txt":
+        # Create env + install from requirements.txt
+        conda_create_cmd = (
+            f"{conda_init} && "
+            f"conda create -n {env_name} python={python_version} -y && "
+            f"conda activate {env_name} && "
+            f"cd {repo_path} && "
+            "pip install --upgrade pip setuptools wheel && "
+            # Try to install requirements.txt if it exists
+            "(test -f requirements.txt && pip install -r requirements.txt || true) && "
+            # Also try common requirements paths
+            "(test -f requirements/dev.txt && pip install -r requirements/dev.txt || true) && "
+            "(test -f dev-requirements.txt && pip install -r dev-requirements.txt || true)"
+        )
+    elif pkgs == "environment.yml":
+        # Create env from environment.yml
+        conda_create_cmd = (
+            f"{conda_init} && "
+            f"cd {repo_path} && "
+            "(test -f environment.yml && conda env create -f environment.yml || "
+            f"conda create -n {env_name} python={python_version} -y) && "
+            f"conda activate {env_name} && "
+            "pip install --upgrade pip setuptools wheel"
+        )
+    else:
+        # Create env with specified packages
+        pkg_list = pkgs if pkgs else ""
+        conda_create_cmd = (
+            f"{conda_init} && "
+            f"conda create -n {env_name} python={python_version} {pkg_list} -y && "
+            f"conda activate {env_name} && "
+            "pip install --upgrade pip setuptools wheel"
+        )
+
+    conda_result = workspace.execute_command(
+        conda_create_cmd,
+        timeout=repo_prepare_timeout,
+    )
+    if conda_result.exit_code != 0:
+        logger.warning(
+            "[Worker] Conda env creation failed for %s (Python %s): %s",
+            instance_id, python_version, conda_result.stderr or conda_result.stdout
+        )
+        # Fallback: try simple env creation
+        fallback_cmd = (
+            f"{conda_init} && "
+            f"conda create -n {env_name} python={python_version} -y && "
+            f"conda activate {env_name} && "
+            "pip install --upgrade pip setuptools wheel"
+        )
+        fallback_result = workspace.execute_command(fallback_cmd, timeout=300.0)
+        if fallback_result.exit_code != 0:
+            logger.error(
+                "[Worker] Fallback conda env creation also failed for %s: %s",
+                instance_id, fallback_result.stderr or fallback_result.stdout
+            )
+            return repo_name, repo_path, base_commit, "", ""
+
+    # Install pip_packages from specs
+    if "pip_packages" in specs and specs["pip_packages"]:
+        pip_packages = " ".join(specs["pip_packages"])
+        pip_install_cmd = (
+            f"{conda_init} && "
+            f"conda activate {env_name} && "
+            f"python -m pip install {pip_packages}"
+        )
+        pip_result = workspace.execute_command(pip_install_cmd, timeout=300.0)
+        if pip_result.exit_code != 0:
+            logger.warning(
+                "[Worker] pip_packages installation failed for %s: %s",
+                instance_id, pip_result.stderr or pip_result.stdout
+            )
+
+    # ── Step 4: Execute pre_install commands ────────────────────────────────
+    # Aligned with swebench/harness/test_spec/python.py:298-300
+    if "pre_install" in specs:
+        for pre_install_cmd in specs["pre_install"]:
+            # Run pre_install commands with conda activated
+            full_cmd = (
+                f"{conda_init} && "
+                f"conda activate {env_name} && "
+                f"{pre_install_cmd}"
+            )
+            pre_result = workspace.execute_command(full_cmd, timeout=300.0)
+            if pre_result.exit_code != 0:
+                logger.warning(
+                    "[Worker] pre_install failed for %s: '%s' -> %s",
+                    instance_id, pre_install_cmd[:50], pre_result.stderr or pre_result.stdout
+                )
+
+    # ── Step 5: Install repo ────────────────────────────────────────────────
+    # Aligned with swebench/harness/test_spec/python.py:302-303
+    if "install" in specs:
+        install_cmd = (
+            f"{conda_init} && "
+            f"conda activate {env_name} && "
+            f"cd {repo_path} && "
+            f"{specs['install']}"
+        )
+        install_result = workspace.execute_command(install_cmd, timeout=600.0)
+        if install_result.exit_code != 0:
+            logger.warning(
+                "[Worker] Repo installation failed for %s: %s",
+                instance_id, install_result.stderr or install_result.stdout
+            )
+            # Fallback: try pip install -e .
+            fallback_install = (
+                f"{conda_init} && "
+                f"conda activate {env_name} && "
+                f"cd {repo_path} && "
+                "(pip install -e . 2>/dev/null || python setup.py develop 2>/dev/null || python setup.py install 2>/dev/null || true)"
+            )
+            workspace.execute_command(fallback_install, timeout=300.0)
+
+    # Always install pytest for running tests
+    pytest_install = (
+        f"{conda_init} && "
+        f"conda activate {env_name} && "
+        "pip install pytest"
+    )
+    workspace.execute_command(pytest_install, timeout=120.0)
+
+    # ── Step 6: Setup commit (aligned with swebench/harness/test_spec/python.py:309-313) ──
+    # This ensures git diff only reflects agent's changes, not setup changes
+    setup_commit_cmd = (
+        f"cd {repo_path} && "
+        "git config user.email setup@swebench.config && "
+        "git config user.name SWE-bench && "
+        "git add -A && "
+        "git commit --allow-empty -am SWE-bench"
+    )
+    workspace.execute_command(setup_commit_cmd, timeout=60.0)
+
+    # ── Step 7: Set up bashrc to auto-activate conda environment ────────────
+    bashrc_setup = (
+        f"echo '{conda_init}' >> ~/.bashrc && "
+        f"echo 'conda activate {env_name}' >> ~/.bashrc"
+    )
+    workspace.execute_command(bashrc_setup, timeout=30.0)
+
+    logger.info(
+        "[Worker] Environment setup complete for %s: Python %s, env=%s, specs=%s",
+        instance_id, python_version, env_name, list(specs.keys())
+    )
+
+    return repo_name, repo_path, base_commit, python_version, env_name
 
 
 def _cleanup_pycodegraph_artifacts(workspace, repo_path: str, instance_id: str) -> None:
@@ -123,7 +340,7 @@ def run_single_instance(task: dict) -> dict:
     try:
         runner = SweBenchRunner(**runner_config)
         workspace = runner.prepare_workspace(instance)
-        _, repo_path, base_commit = _prepare_repo(workspace, instance)
+        _, repo_path, base_commit, python_version, conda_env_name = _prepare_repo(workspace, instance)
 
         if use_pycodegraph:
             pycodegraph_ready = setup_pycodegraph(workspace, repo_path)
@@ -137,6 +354,8 @@ def run_single_instance(task: dict) -> dict:
                 "repo_path": repo_path,
                 "problem_statement": str(instance.get("problem_statement", "")).strip(),
                 "base_commit": base_commit,
+                "python_version": python_version,
+                "conda_env_name": conda_env_name,
             },
         )
 
@@ -170,11 +389,14 @@ def run_single_instance(task: dict) -> dict:
         )
         git_patch = diff_result.stdout if diff_result.exit_code == 0 else ""
 
+        model_name = llm_cfg.get("llm_name", "agent")
         eval_result = run_swebench_eval(
             instance=instance,
             git_patch=git_patch,
             run_id=str(uuid.uuid4())[:8],
             tmp_dir=tmp_root,
+            model_name_or_path=model_name,
+            skip_completed=True,
         )
         return {
             "instance_id": instance_id,
@@ -182,12 +404,18 @@ def run_single_instance(task: dict) -> dict:
             "resolved": eval_result.get("resolved", False),
             "patch_applied": eval_result.get("patch_applied", False),
             "error": eval_result.get("error"),
+            "skipped": eval_result.get("skipped", False),
+            "timed_out": eval_result.get("timed_out", False),
         }
     except Exception as exc:
         logger.error("[Worker] Error in %s: %s", instance_id, exc)
         return {
             "instance_id": instance_id,
+            "git_patch": "",
             "resolved": False,
+            "patch_applied": False,
+            "timed_out": False,
+            "skipped": False,
             "error": str(exc),
             "traceback": traceback.format_exc(),
         }

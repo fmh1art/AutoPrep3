@@ -70,6 +70,19 @@ RUN set -eux; \
         # Docker dependencies
         apt-transport-https gnupg lsb-release; \
     \
+    # Install Miniconda for multi-Python version support (SWE-bench requires Python 3.5-3.11)
+    wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh; \
+    bash /tmp/miniconda.sh -b -p /opt/miniconda3; \
+    rm /tmp/miniconda.sh; \
+    # Add conda to system PATH for all users
+    echo 'export PATH="/opt/miniconda3/bin:$PATH"' >> /etc/profile.d/conda.sh; \
+    echo ". /opt/miniconda3/etc/profile.d/conda.sh" >> /etc/profile.d/conda.sh; \
+    chmod +x /etc/profile.d/conda.sh; \
+    # Initialize conda for root and the user
+    /opt/miniconda3/bin/conda init bash; \
+    # Configure conda to not auto-activate base
+    /opt/miniconda3/bin/conda config --set auto_activate_base false; \
+    \
     # Create user and group
     (getent group ${GID} || groupadd -g ${GID} ${USERNAME}); \
     (id -u ${USERNAME} >/dev/null 2>&1 || useradd -m -u ${UID} -g ${GID} -s /bin/bash ${USERNAME}); \
@@ -79,6 +92,8 @@ RUN set -eux; \
     # Create workspace directory
     mkdir -p /workspace/project; \
     chown -R ${USERNAME}:${USERNAME} /workspace; \
+    # Give user access to conda
+    chown -R ${USERNAME}:${USERNAME} /opt/miniconda3; \
     rm -rf /var/lib/apt/lists/*
 
 # Pre-install ACP servers for ACPAgent support (Claude Code + Codex)

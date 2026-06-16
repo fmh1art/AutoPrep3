@@ -22,6 +22,12 @@ from swebench.harness.constants import (
     DOCKER_PATCH,
     DOCKER_USER,
     DOCKER_WORKDIR,
+    KEY_INSTANCE_ID,
+    KEY_MODEL,
+    KEY_PREDICTION,
+    LOG_REPORT,
+    LOG_TEST_OUTPUT,
+    RUN_EVALUATION_LOG_DIR,
     UTF8,
 )
 from swebench.harness.docker_build import (
@@ -69,9 +75,12 @@ def run_swebench_eval(
     run_id: str | None = None,
     tmp_dir: str = "/tmp",
     timeout: int = 1800,
+    model_name_or_path: str = "agent",
+    skip_completed: bool = True,
 ) -> dict[str, Any]:
     """
     在 SWE-bench 官方镜像中运行评估，直接使用 swebench.harness API。
+    与官方 run_evaluation.py 流程完全对齐。
 
     Args:
         instance:  SWE-bench 数据集中的单条记录（dict），需包含以下字段：
@@ -81,6 +90,8 @@ def run_swebench_eval(
         run_id:    运行 ID，用于容器命名和日志目录；默认随机生成
         tmp_dir:   本地临时目录，用于存放日志和 patch 文件
         timeout:   eval.sh 执行超时秒数
+        model_name_or_path: 模型名称，用于日志目录结构
+        skip_completed: 如果 report.json 已存在则跳过该实例
 
     Returns:
         dict，包含：
@@ -89,6 +100,7 @@ def run_swebench_eval(
           - timed_out (bool)      : 是否超时（可选）
           - report (dict)         : get_eval_report 返回的完整报告
           - error (str | None)    : 异常信息（如有）
+          - skipped (bool)        : 是否因已完成而跳过
     """
     if run_id is None:
         run_id = str(uuid.uuid4())[:8]
@@ -96,14 +108,49 @@ def run_swebench_eval(
     instance_id = instance["instance_id"]
     client = docker.from_env()
 
-    # TestSpec：namespace="swebench" 表示使用远程镜像（直接 pull）
-    test_spec = make_test_spec(instance, namespace=SWEBENCH_IMAGE_PREFIX)
+    # ── 1. 空 patch 检查（与官方对齐：空 patch 不运行评估）───────────────────
+    if git_patch is None or git_patch.strip() == "":
+        return {
+            "instance_id": instance_id,
+            "resolved": False,
+            "patch_applied": False,
+            "timed_out": False,
+            "report": {},
+            "error": "empty patch",
+            "skipped": True,
+        }
 
-    # 日志目录
-    log_dir = Path(tmp_dir) / "swe_eval_logs" / instance_id
+    # TestSpec：namespace="swebench" 表示使用远程镜像（直接 pull）
+    # 与官方对齐：显式指定 arch="x86_64"
+    test_spec = make_test_spec(
+        instance,
+        namespace=SWEBENCH_IMAGE_PREFIX,
+        arch="x86_64",
+    )
+
+    # 日志目录结构与官方对齐：logs/run_evaluation/{run_id}/{model_name}/{instance_id}/
+    model_name_safe = model_name_or_path.replace("/", "__")
+    log_dir = Path(tmp_dir) / RUN_EVALUATION_LOG_DIR / run_id / model_name_safe / instance_id
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "eval.log"
+    log_file = log_dir / "run_instance.log"
+    report_path = log_dir / LOG_REPORT
     logger = setup_logger(instance_id, log_file)
+
+    # ── 2. 已完成实例跳过（与官方对齐）──────────────────────────────────────
+    if skip_completed and report_path.exists():
+        import json
+        report = json.loads(report_path.read_text())
+        resolved = report.get(instance_id, {}).get("resolved", False)
+        logger.info(f"Skipping {instance_id} - already completed, resolved={resolved}")
+        return {
+            "instance_id": instance_id,
+            "resolved": resolved,
+            "patch_applied": True,
+            "timed_out": False,
+            "report": report,
+            "error": None,
+            "skipped": True,
+        }
 
     container = None
     try:
@@ -122,6 +169,9 @@ def run_swebench_eval(
         # ── 2. 写入并应用 patch ────────────────────────────────────────────
         patch_file = log_dir / "patch.diff"
         patch_file.write_text(git_patch or "", encoding=UTF8)
+        logger.info(
+            f"Intermediate patch for {instance_id} written to {patch_file}, now applying to container..."
+        )
         copy_to_container(container, patch_file, PurePosixPath(DOCKER_PATCH))
 
         applied_patch = False
@@ -132,48 +182,82 @@ def run_swebench_eval(
                 user=DOCKER_USER,
             )
             if val.exit_code == 0:
-                logger.info(f"Patch applied with: {cmd}")
+                logger.info(f"Applied Patch:\n{val.output.decode(UTF8)}")
                 applied_patch = True
                 break
             else:
-                logger.info(f"Patch apply failed with '{cmd}': {val.output.decode(UTF8)}")
+                logger.info(f"Failed to apply patch to container: {cmd}")
 
         if not applied_patch:
-            logger.info(f"All patch apply commands failed for {instance_id}")
+            logger.info(f">>>>> Patch Apply Failed:\n{val.output.decode(UTF8)}")
             return {
+                "instance_id": instance_id,
                 "resolved": False,
                 "patch_applied": False,
+                "timed_out": False,
                 "report": {},
                 "error": "patch apply failed",
+                "skipped": False,
             }
 
-        # ── 3. 写入并执行 eval.sh ──────────────────────────────────────────
+        # ── 3. 获取 eval.sh 执行前的 git diff（与官方对齐）───────────────────
+        git_diff_output_before = (
+            container.exec_run(
+                "git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR
+            )
+            .output.decode(UTF8)
+            .strip()
+        )
+        logger.info(f"Git diff before:\n{git_diff_output_before}")
+
+        # ── 4. 写入并执行 eval.sh ──────────────────────────────────────────
         eval_file = log_dir / "eval.sh"
         eval_file.write_text(test_spec.eval_script, encoding=UTF8)
+        logger.info(
+            f"Eval script for {instance_id} written to {eval_file}; copying to container..."
+        )
         copy_to_container(container, eval_file, PurePosixPath("/eval.sh"))
 
         test_output, timed_out, runtime = exec_run_with_timeout(
             container, "/bin/bash /eval.sh", timeout
         )
-        logger.info(f"Test runtime: {runtime:.2f}s, timed_out={timed_out}")
-
-        test_output_path = log_dir / "test_output.txt"
-        test_output_path.write_text(test_output, encoding=UTF8)
+        test_output_path = log_dir / LOG_TEST_OUTPUT
+        logger.info(f"Test runtime: {runtime:.2f} seconds")
+        with open(test_output_path, "w", encoding=UTF8) as f:
+            f.write(test_output)
+            logger.info(f"Test output for {instance_id} written to {test_output_path}")
+            if timed_out:
+                f.write(f"\n\nTimeout error: {timeout} seconds exceeded.")
 
         if timed_out:
             return {
+                "instance_id": instance_id,
                 "resolved": False,
                 "patch_applied": True,
                 "timed_out": True,
                 "report": {},
-                "error": f"eval timed out after {timeout}s",
+                "error": f"Test timed out after {timeout} seconds.",
+                "skipped": False,
             }
 
-        # ── 4. 解析结果 ────────────────────────────────────────────────────
+        # ── 5. 获取 eval.sh 执行后的 git diff 并对比（与官方对齐）────────────
+        git_diff_output_after = (
+            container.exec_run(
+                "git -c core.fileMode=false diff", workdir=DOCKER_WORKDIR
+            )
+            .output.decode(UTF8)
+            .strip()
+        )
+        logger.info(f"Git diff after:\n{git_diff_output_after}")
+        if git_diff_output_after != git_diff_output_before:
+            logger.info("Git diff changed after running eval script")
+
+        # ── 6. 解析结果 ────────────────────────────────────────────────────
+        logger.info(f"Grading answer for {instance_id}...")
         prediction = {
-            "instance_id": instance_id,
-            "model_patch": git_patch,
-            "model_name_or_path": "agent",
+            KEY_INSTANCE_ID: instance_id,
+            KEY_PREDICTION: git_patch,
+            KEY_MODEL: model_name_or_path,
         }
         report = get_eval_report(
             test_spec=test_spec,
@@ -182,26 +266,38 @@ def run_swebench_eval(
             include_tests_status=True,
         )
         resolved = report.get(instance_id, {}).get("resolved", False)
-        logger.info(f"Eval result for {instance_id}: resolved={resolved}")
+        logger.info(
+            f"report: {report}\n"
+            f"Result for {instance_id}: resolved: {resolved}"
+        )
+
+        # ── 7. 写入 report.json（与官方对齐）────────────────────────────────
+        with open(report_path, "w", encoding=UTF8) as f:
+            import json
+            f.write(json.dumps(report, indent=4))
 
         return {
+            "instance_id": instance_id,
             "resolved": resolved,
             "patch_applied": True,
             "timed_out": False,
             "report": report,
             "error": None,
+            "skipped": False,
         }
 
     except Exception as e:
         import traceback
         err = traceback.format_exc()
-        logger.error(f"Error in run_swebench_eval for {instance_id}: {e}\n{err}")
+        logger.error(f"Error in evaluating model for {instance_id}: {e}\n{err}")
         return {
+            "instance_id": instance_id,
             "resolved": False,
             "patch_applied": False,
             "timed_out": False,
             "report": {},
             "error": str(e),
+            "skipped": False,
         }
 
     finally:
